@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8B5CF6"/>
+      <stop offset="50%" stop-color="#EC4899"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="15" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="110" fill="url(#grad)" filter="url(#glow)"/>
+  <!-- Soundwave Bars -->
+  <rect x="110" y="210" width="22" height="92" rx="11" fill="#ffffff" opacity="0.9"/>
+  <rect x="146" y="160" width="22" height="192" rx="11" fill="#ffffff" opacity="0.95"/>
+  <rect x="182" y="180" width="22" height="152" rx="11" fill="#ffffff" opacity="0.9"/>
+  <rect x="218" y="130" width="22" height="252" rx="11" fill="#ffffff"/>
+  <!-- Play Icon -->
+  <polygon points="280,180 280,332 400,256" fill="#ffffff"/>
+</svg>
+

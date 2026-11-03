@@ -1,0 +1,542 @@
+import os
+import sys
+import time
+import json
+import socket
+import re
+import io
+import base64
+import subprocess
+import threading
+
+# Ensure UTF-8 output on Windows consoles
+try:
+    if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
+from urllib.parse import quote
+from flask import Flask, request, jsonify, render_template, Response, send_file, send_from_directory
+import requests
+import yt_dlp
+import imageio_ffmpeg
+import qrcode
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, 'static')
+TEMPLATE_DIR = os.path.join(BASE_DIR, 'templates')
+
+app = Flask(__name__, static_folder=STATIC_DIR, template_folder=TEMPLATE_DIR)
+PORT = int(os.environ.get('PORT', 5500))
+IS_RENDER = os.environ.get('RENDER') is not None
+PUBLIC_URL = os.environ.get('RENDER_EXTERNAL_URL') if IS_RENDER else None
+CLOUDFLARED_PROC = None
+
+# Configure ffmpeg path
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
+# Thread-safe in-memory caches
+STREAM_CACHE = {}     # key: f"{video_id}_{type}" -> (url, expiry_timestamp, content_type)
+SEARCH_CACHE = {}     # key: query_str -> (results, expiry_timestamp)
+TRENDING_CACHE = {}   # key: category -> (results, expiry_timestamp)
+LYRICS_CACHE = {}     # key: f"{title}_{artist}" -> lyrics_data
+
+def get_local_ip():
+    """Find the local WiFi / LAN IP of this computer."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1.0)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return '127.0.0.1'
+
+def format_duration(seconds):
+    """Format seconds into MM:SS or HH:MM:SS."""
+    if not seconds:
+        return "0:00"
+    try:
+        sec = int(seconds)
+        hours = sec // 3600
+        mins = (sec % 3600) // 60
+        secs = sec % 60
+        if hours > 0:
+            return f"{hours}:{mins:02d}:{secs:02d}"
+        return f"{mins}:{secs:02d}"
+    except Exception:
+        return "0:00"
+
+def format_views(view_count):
+    """Format view count into readable short format (e.g. 1.2M, 540K)."""
+    if not view_count:
+        return ""
+    try:
+        vc = int(view_count)
+        if vc >= 1_000_000_000:
+            return f"{vc / 1_000_000_000:.1f}B tayangan"
+        if vc >= 1_000_000:
+            return f"{vc / 1_000_000:.1f}M tayangan"
+        if vc >= 1_000:
+            return f"{vc / 1_000:.1f}K tayangan"
+        return f"{vc} tayangan"
+    except Exception:
+        return ""
+
+def clean_song_title(title):
+    """Clean track title by removing boilerplate tags like (Official Video), [HD], etc."""
+    cleaned = re.sub(r'\(.*?(official|video|audio|lirik|lyric|hd|mv|remastered|hq).*?\)', '', title, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\[.*?(official|video|audio|lirik|lyric|hd|mv|remastered|hq).*?\]', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+def generate_qr_base64(url):
+    """Generate a base64 encoded PNG QR code."""
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=2,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="#7c3aed", back_color="#090a10")
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return base64.b64encode(buf.getvalue()).decode('utf-8')
+
+def start_cloudflared_tunnel():
+    """Start Cloudflare Tunnel in background to bypass AP/Client Isolation and firewalls (local Windows only)."""
+    global PUBLIC_URL, CLOUDFLARED_PROC
+    if IS_RENDER or sys.platform != 'win32':
+        return
+
+    cf_path = os.path.join(BASE_DIR, 'cloudflared.exe')
+    if not os.path.exists(cf_path):
+        return
+
+    try:
+        cmd = [cf_path, 'tunnel', '--url', f'http://127.0.0.1:{PORT}']
+        CLOUDFLARED_PROC = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+        for line in CLOUDFLARED_PROC.stdout:
+            m = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+            if m:
+                PUBLIC_URL = m.group(0)
+                print(f"\n[CLOUDFLARE HTTPS TUNNEL AKTIF]")
+                print(f"👉 Link HP Bebas Blokir: {PUBLIC_URL}")
+                print(f"Scan ulang QR code di aplikasi untuk membuka link ini di HP Anda!\n")
+                break
+    except Exception as e:
+        print("Cloudflare Tunnel startup error:", e)
+
+# Launch Cloudflare tunnel thread
+threading.Thread(target=start_cloudflared_tunnel, daemon=True).start()
+
+def get_ydl_options(extract_flat=True, format_spec='140/251/bestaudio[ext=m4a]/bestaudio/best'):
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'ffmpeg_location': FFMPEG_PATH,
+        'js_runtimes': {'node': {}}
+    }
+    if extract_flat:
+        opts['extract_flat'] = True
+    else:
+        opts['format'] = format_spec
+    return opts
+
+@app.route('/')
+def index():
+    local_ip = get_local_ip()
+    local_url = f"http://{local_ip}:{PORT}"
+    
+    if IS_RENDER:
+        target_url = os.environ.get('RENDER_EXTERNAL_URL') or request.host_url.rstrip('/')
+    else:
+        target_url = PUBLIC_URL if PUBLIC_URL else local_url
+
+    qr_b64 = generate_qr_base64(target_url)
+    return render_template('index.html', 
+                           network_url=target_url, 
+                           local_url=local_url,
+                           public_url=target_url if (IS_RENDER or PUBLIC_URL) else None,
+                           qr_b64=qr_b64, 
+                           local_ip=local_ip, 
+                           port=PORT)
+
+@app.route('/manifest.json')
+def manifest():
+    return send_from_directory(STATIC_DIR, 'manifest.json', mimetype='application/manifest+json')
+
+@app.route('/sw.js')
+def service_worker():
+    return send_from_directory(STATIC_DIR, 'sw.js', mimetype='application/javascript')
+
+@app.route('/api/network-info')
+def network_info():
+    local_ip = get_local_ip()
+    local_url = f"http://{local_ip}:{PORT}"
+    
+    if IS_RENDER:
+        target_url = os.environ.get('RENDER_EXTERNAL_URL') or request.host_url.rstrip('/')
+        pub_url = target_url
+    else:
+        target_url = PUBLIC_URL if PUBLIC_URL else local_url
+        pub_url = PUBLIC_URL
+
+    return jsonify({
+        'ip': local_ip,
+        'port': PORT,
+        'local_url': local_url,
+        'public_url': pub_url,
+        'url': target_url,
+        'qr': generate_qr_base64(target_url)
+    })
+
+@app.route('/api/suggestions')
+def suggestions():
+    q = request.args.get('q', '').strip()
+    if not q:
+        return jsonify([])
+    try:
+        url = f"https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q={quote(q)}"
+        r = requests.get(url, timeout=3)
+        if r.status_code == 200:
+            data = r.json()
+            return jsonify(data[1][:8])
+    except Exception as e:
+        print("Suggestion error:", e)
+    return jsonify([])
+
+@app.route('/api/search')
+def search():
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify([])
+
+    now = time.time()
+    cache_key = query.lower()
+    if cache_key in SEARCH_CACHE:
+        cached_res, exp = SEARCH_CACHE[cache_key]
+        if now < exp:
+            return jsonify(cached_res)
+
+    try:
+        ydl_opts = get_ydl_options(extract_flat=True)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            res = ydl.extract_info(f"ytsearch20:{query}", download=False)
+            entries = res.get('entries', []) or []
+            
+            clean_entries = []
+            for e in entries:
+                if not e or not e.get('id'):
+                    continue
+                vid_id = e.get('id')
+                raw_title = e.get('title') or 'Lagu'
+                clean_title = clean_song_title(raw_title)
+                artist = e.get('channel') or e.get('uploader') or 'Artis'
+                duration = e.get('duration') or 0
+                views = e.get('view_count') or 0
+                
+                thumb = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
+                if e.get('thumbnails') and len(e['thumbnails']) > 0:
+                    thumb = e['thumbnails'][-1].get('url') or thumb
+
+                clean_entries.append({
+                    'id': vid_id,
+                    'title': clean_title,
+                    'raw_title': raw_title,
+                    'artist': artist,
+                    'duration': duration,
+                    'duration_formatted': format_duration(duration),
+                    'thumbnail': thumb,
+                    'views': format_views(views)
+                })
+
+            SEARCH_CACHE[cache_key] = (clean_entries, now + 900)  # 15 min cache
+            return jsonify(clean_entries)
+    except Exception as e:
+        print("Search error:", e)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/trending')
+def trending():
+    cat = request.args.get('category', 'indo').lower()
+    now = time.time()
+    
+    if cat in TRENDING_CACHE:
+        cached_res, exp = TRENDING_CACHE[cat]
+        if now < exp:
+            return jsonify(cached_res)
+
+    category_queries = {
+        'indo': 'Lagu Pop Indonesia Terbaru Viral Hits',
+        'global': 'Top 50 Global Popular Music Hits',
+        'chill': 'Lofi Hip Hop Chill Beats relaxing study',
+        'koplo': 'Dangdut Koplo Terbaru Viral Joget',
+        'rock': 'Best Classic Rock & Alternative Hits',
+        'anime': 'Popular Anime Opening Songs J-Pop',
+        'acoustic': 'Acoustic Cover Hits Lagu Santai Akustik'
+    }
+
+    query = category_queries.get(cat, category_queries['indo'])
+    try:
+        ydl_opts = get_ydl_options(extract_flat=True)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            res = ydl.extract_info(f"ytsearch15:{query}", download=False)
+            entries = res.get('entries', []) or []
+            
+            clean_entries = []
+            for e in entries:
+                if not e or not e.get('id'):
+                    continue
+                vid_id = e.get('id')
+                raw_title = e.get('title') or 'Lagu'
+                clean_title = clean_song_title(raw_title)
+                artist = e.get('channel') or e.get('uploader') or 'Artis'
+                duration = e.get('duration') or 0
+                views = e.get('view_count') or 0
+                thumb = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
+
+                clean_entries.append({
+                    'id': vid_id,
+                    'title': clean_title,
+                    'raw_title': raw_title,
+                    'artist': artist,
+                    'duration': duration,
+                    'duration_formatted': format_duration(duration),
+                    'thumbnail': thumb,
+                    'views': format_views(views)
+                })
+
+            TRENDING_CACHE[cat] = (clean_entries, now + 3600)  # 1 hour cache
+            return jsonify(clean_entries)
+    except Exception as e:
+        print("Trending error:", e)
+        return jsonify([]), 500
+
+@app.route('/api/info/<video_id>')
+def video_info(video_id):
+    try:
+        ydl_opts = get_ydl_options(extract_flat=False, format_spec='140/251/bestaudio[ext=m4a]/bestaudio/best')
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            raw_title = info.get('title') or ''
+            clean_title = clean_song_title(raw_title)
+            artist = info.get('channel') or info.get('uploader') or ''
+            duration = info.get('duration') or 0
+            
+            return jsonify({
+                'id': video_id,
+                'title': clean_title,
+                'raw_title': raw_title,
+                'artist': artist,
+                'duration': duration,
+                'duration_formatted': format_duration(duration),
+                'thumbnail': f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+                'thumbnail_fallback': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                'views': format_views(info.get('view_count')),
+                'description': info.get('description', '')[:300]
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def get_stream_url(video_id, media_type='audio'):
+    """
+    Extract direct stream URL from YouTube using yt-dlp with caching.
+    - audio: uses pure audio (140=m4a AAC, 251=webm Opus) with web client.
+    - video: uses android client format 18 (MP4 with 360p/480p video + audio combined).
+    """
+    cache_key = f"{video_id}_{media_type}"
+    now = time.time()
+    
+    if cache_key in STREAM_CACHE:
+        url, exp, mime = STREAM_CACHE[cache_key]
+        if now < exp:
+            return url, mime
+
+    if media_type == 'audio':
+        format_spec = '140/251/bestaudio[ext=m4a]/bestaudio/best'
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'ffmpeg_location': FFMPEG_PATH,
+            'js_runtimes': {'node': {}},
+            'format': format_spec
+        }
+    else:
+        # Video mode: Use android client format 18 for progressive MP4 (audio + video combined)
+        format_spec = '18/best'
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'ffmpeg_location': FFMPEG_PATH,
+            'js_runtimes': {'node': {}},
+            'extractor_args': {'youtube': {'player_client': ['android']}},
+            'format': format_spec
+        }
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        stream_url = info.get('url')
+        
+        ext = info.get('ext', '')
+        if media_type == 'audio':
+            mime = 'audio/mp4' if ext in ['m4a', 'mp4', 'aac'] else 'audio/webm'
+        else:
+            mime = 'video/mp4'
+            
+        STREAM_CACHE[cache_key] = (stream_url, now + 10800, mime)  # 3 hours TTL
+        return stream_url, mime
+
+@app.route('/api/stream/<video_id>')
+def stream_media(video_id):
+    """
+    Robust stream proxy supporting HTTP 206 Partial Content (Range requests).
+    Guarantees 100% ad-free audio/video playback and seamless seeking on all mobile browsers!
+    """
+    media_type = request.args.get('type', 'audio').lower()
+    try:
+        stream_url, mime_type = get_stream_url(video_id, media_type)
+        if not stream_url:
+            return jsonify({'error': 'Stream URL not found'}), 404
+
+        range_header = request.headers.get('Range')
+        forward_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        if range_header:
+            forward_headers['Range'] = range_header
+
+        # Stream request from GoogleVideo CDN
+        upstream = requests.get(stream_url, headers=forward_headers, stream=True, timeout=12)
+        
+        status_code = upstream.status_code
+        response_headers = {
+            'Content-Type': upstream.headers.get('Content-Type', mime_type),
+            'Accept-Ranges': 'bytes',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Range, Content-Type, Accept',
+            'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges',
+            'Cache-Control': 'no-cache'
+        }
+
+        if 'Content-Range' in upstream.headers:
+            response_headers['Content-Range'] = upstream.headers['Content-Range']
+        if 'Content-Length' in upstream.headers:
+            response_headers['Content-Length'] = upstream.headers['Content-Length']
+
+        def generate_chunks():
+            try:
+                for chunk in upstream.iter_content(chunk_size=65536):
+                    if chunk:
+                        yield chunk
+            except Exception as stream_err:
+                pass
+            finally:
+                upstream.close()
+
+        return Response(generate_chunks(), status=status_code, headers=response_headers)
+
+    except Exception as e:
+        print("Stream error:", e)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/lyrics')
+def lyrics():
+    title = request.args.get('title', '').strip()
+    artist = request.args.get('artist', '').strip()
+    
+    clean_title = clean_song_title(title)
+    clean_title = re.sub(r'feat\..*|ft\..*', '', clean_title, flags=re.IGNORECASE).strip()
+    clean_artist = re.sub(r'feat\..*|ft\..*|- Topic|Official', '', artist, flags=re.IGNORECASE).strip()
+    
+    cache_key = f"{clean_title}_{clean_artist}".lower()
+    if cache_key in LYRICS_CACHE:
+        return jsonify(LYRICS_CACHE[cache_key])
+        
+    try:
+        params = {'track_name': clean_title, 'artist_name': clean_artist}
+        r = requests.get('https://lrclib.net/api/get', params=params, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            result = {
+                'synced': data.get('syncedLyrics'),
+                'plain': data.get('plainLyrics'),
+                'found': True
+            }
+            LYRICS_CACHE[cache_key] = result
+            return jsonify(result)
+            
+        search_res = requests.get('https://lrclib.net/api/search', params={'q': f"{clean_title} {clean_artist}"}, timeout=4)
+        if search_res.status_code == 200:
+            hits = search_res.json()
+            if hits and len(hits) > 0:
+                best = hits[0]
+                result = {
+                    'synced': best.get('syncedLyrics'),
+                    'plain': best.get('plainLyrics'),
+                    'found': True
+                }
+                LYRICS_CACHE[cache_key] = result
+                return jsonify(result)
+                
+    except Exception as e:
+        print("Lyrics fetch error:", e)
+
+    return jsonify({'found': False, 'message': 'Lirik belum tersedia untuk lagu ini.'})
+
+@app.route('/api/download/<video_id>')
+def download_track(video_id):
+    """Download audio stream file directly to mobile phone storage."""
+    title = request.args.get('title', 'music').strip()
+    clean_name = re.sub(r'[\\/*?:"<>|]', "", title) or f"track_{video_id}"
+    filename = f"{clean_name}.m4a"
+    
+    try:
+        stream_url, _ = get_stream_url(video_id, 'audio')
+        upstream = requests.get(stream_url, stream=True, timeout=12)
+        
+        headers = {
+            'Content-Type': 'audio/mp4',
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'Content-Length': upstream.headers.get('Content-Length')
+        }
+        
+        def generate():
+            try:
+                for chunk in upstream.iter_content(chunk_size=65536):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+
+        return Response(generate(), headers=headers)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    local_ip = get_local_ip()
+    local_url = f"http://{local_ip}:{PORT}"
+    
+    print("\n" + "="*60)
+    print("  [KEDAI MUSIK] PEMUTAR MUSIK YOUTUBE TANPA IKLAN")
+    print("="*60)
+    print(f"  [PC / Local]   : http://localhost:{PORT}")
+    print(f"  [HP / WiFi]    : {local_url}")
+    print("="*60)
+    print("  Sedang menyiapkan Cloudflare Tunnel untuk koneksi HP bebas blokir...")
+    print("="*60 + "\n")
+    
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)

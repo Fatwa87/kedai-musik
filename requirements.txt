@@ -1,0 +1,7 @@
+Flask>=3.0.0
+yt-dlp>=2024.08.01
+requests>=2.31.0
+imageio-ffmpeg>=0.4.9
+qrcode>=7.4.2
+pillow>=10.0.0
+gunicorn>=21.2.0

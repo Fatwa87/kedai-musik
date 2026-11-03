@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Kedai Musik - Pemutar Musik YouTube Bebas Iklan</title>
+  
+  <!-- PWA & Mobile Meta Tags -->
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#090a10">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Kedai Musik">
+  <link rel="icon" type="image/svg+xml" href="/static/icons/favicon.svg">
+  <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+  
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="/static/css/style.css?v=2">
+</head>
+<body data-theme="dark">
+
+  <!-- Mobile App Wrapper -->
+  <div id="app" class="app-container">
+
+    <!-- Top App Bar (Header) -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-logo">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 18V5l12-2v13" stroke="url(#h-grad)" />
+            <circle cx="6" cy="18" r="3" fill="url(#h-grad)" />
+            <circle cx="18" cy="16" r="3" fill="url(#h-grad)" />
+            <defs>
+              <linearGradient id="h-grad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#8B5CF6"/>
+                <stop offset="100%" stop-color="#EC4899"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <span class="brand-name">Kedai <span>Musik</span></span>
+        <span class="ad-free-badge">BEBAS IKLAN</span>
+      </div>
+
+      <div class="header-actions">
+        <button id="btnConnectQr" class="icon-btn" title="Koneksi HP" aria-label="Koneksi HP">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="7" height="7"/>
+            <rect x="14" y="3" width="7" height="7"/>
+            <rect x="14" y="14" width="7" height="7"/>
+            <rect x="3" y="14" width="7" height="7"/>
+          </svg>
+        </button>
+        <button id="btnInstallPwa" class="pill-btn highlight-btn hidden" aria-label="Pasang Aplikasi">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          <span>Pasang di HP</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Content Views (Tab Switcher) -->
+    <main class="app-main">
+
+      <!-- TAB 1: BERANDA / HOME -->
+      <section id="viewHome" class="view-section active">
+        <!-- Hero Banner -->
+        <div class="hero-banner">
+          <div class="hero-glow"></div>
+          <div class="hero-content">
+            <span class="hero-tag">🔥 Trending Musik</span>
+            <h2>Dengarkan Musik YouTube Tanpa Iklan</h2>
+            <p>Putar musik di latar belakang saat layar mati atau buka aplikasi lain di HP.</p>
+          </div>
+        </div>
+
+        <!-- Quick Trending Categories Pills -->
+        <div class="category-scroll-container">
+          <div class="category-pills">
+            <button class="cat-pill active" data-category="indo">🇮🇩 Indo Hits</button>
+            <button class="cat-pill" data-category="global">🌍 Global Top</button>
+            <button class="cat-pill" data-category="chill">☕ Lofi Chill</button>
+            <button class="cat-pill" data-category="koplo">💃 Dangdut Koplo</button>
+            <button class="cat-pill" data-category="acoustic">🎸 Akustik</button>
+            <button class="cat-pill" data-category="rock">⚡ Rock</button>
+            <button class="cat-pill" data-category="anime">🍙 Anime & J-Pop</button>
+          </div>
+        </div>
+
+        <!-- Song List Section -->
+        <div class="section-title-wrap">
+          <h3 id="categoryTitle" class="section-title">Lagu Pop Indonesia Terbaru</h3>
+          <button id="btnPlayAllCategory" class="btn-text">Putar Semua</button>
+        </div>
+
+        <div id="homeSongList" class="song-list">
+          <!-- Dynamic skeleton or songs will be loaded here -->
+          <div class="skeleton-list">
+            <div class="skeleton-item"></div>
+            <div class="skeleton-item"></div>
+            <div class="skeleton-item"></div>
+            <div class="skeleton-item"></div>
+            <div class="skeleton-item"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: PENCARIAN / SEARCH -->
+      <section id="viewSearch" class="view-section">
+        <!-- Search Input Bar -->
+        <div class="search-bar-wrap">
+          <div class="search-input-box">
+            <svg class="search-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="8"/>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input type="text" id="searchInput" placeholder="Cari lagu, artis, atau video YouTube..." autocomplete="off">
+            <button id="btnClearSearch" class="btn-clear hidden" aria-label="Hapus">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"/>
+                <line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Live Auto-Suggestions Popup / List -->
+        <div id="suggestionsList" class="suggestions-list hidden"></div>
+
+        <!-- Search History / Popular Queries -->
+        <div id="searchSuggestionsBox" class="search-meta-box">
+          <div class="meta-section">
+            <div class="meta-title-row">
+              <h4>Pencarian Populer</h4>
+            </div>
+            <div class="tag-cloud">
+              <button class="search-tag">Bernadya</button>
+              <button class="search-tag">Tulus</button>
+              <button class="search-tag">Mahalini</button>
+              <button class="search-tag">Sal Priadi Dari Planet Lain</button>
+              <button class="search-tag">Coldplay Yellow</button>
+              <button class="search-tag">Nadin Amizah</button>
+              <button class="search-tag">Hindia Evaluasi</button>
+              <button class="search-tag">Bruno Mars</button>
+              <button class="search-tag">Lofi Beats To Relax</button>
+            </div>
+          </div>
+
+          <div id="historySection" class="meta-section hidden">
+            <div class="meta-title-row">
+              <h4>Riwayat Pencarian</h4>
+              <button id="btnClearHistory" class="btn-text danger">Hapus Semua</button>
+            </div>
+            <div id="historyList" class="history-list"></div>
+          </div>
+        </div>
+
+        <!-- Search Results List -->
+        <div id="searchResultsSection" class="search-results-section hidden">
+          <div class="section-title-wrap">
+            <h3 id="searchResultsTitle" class="section-title">Hasil Pencarian</h3>
+            <span id="resultsCount" class="badge-count">0 lagu</span>
+          </div>
+          <div id="searchResultsList" class="song-list"></div>
+        </div>
+      </section>
+
+      <!-- TAB 3: DAFTAR PUTAR & ANTREAN / QUEUE -->
+      <section id="viewQueue" class="view-section">
+        <div class="section-title-wrap">
+          <div>
+            <h3 class="section-title">Antrean Putar (Queue)</h3>
+            <p class="section-subtitle"><span id="queueCount">0</span> lagu siap diputar berikutnya</p>
+          </div>
+          <button id="btnClearQueue" class="btn-text danger">Bersihkan</button>
+        </div>
+
+        <div id="queueList" class="song-list">
+          <div class="empty-state">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>
+            </svg>
+            <p>Antrean masih kosong</p>
+            <span>Pilih lagu dari Beranda atau Pencarian untuk ditambahkan ke antrean.</span>
+          </div>
+        </div>
+
+        <div class="section-title-wrap mt-6">
+          <h3 class="section-title">Riwayat Lagu yang Baru Diputar</h3>
+        </div>
+        <div id="recentlyPlayedList" class="song-list"></div>
+      </section>
+
+      <!-- TAB 4: FAVORIT / LIKED -->
+      <section id="viewFavorites" class="view-section">
+        <div class="section-title-wrap">
+          <div>
+            <h3 class="section-title">Lagu Favorit</h3>
+            <p class="section-subtitle"><span id="favoritesCount">0</span> lagu tersimpan di HP Anda</p>
+          </div>
+          <button id="btnPlayAllFavorites" class="btn-text">Putar Semua</button>
+        </div>
+
+        <div id="favoritesList" class="song-list">
+          <div class="empty-state">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+            </svg>
+            <p>Belum ada lagu favorit</p>
+            <span>Tekan ikon hati ❤️ pada lagu atau di player untuk menyimpannya di sini.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 5: PENGATURAN / SETTINGS -->
+      <section id="viewSettings" class="view-section">
+        <div class="section-title-wrap">
+          <h3 class="section-title">Pengaturan & Informasi</h3>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-row">
+            <div class="settings-info">
+              <h4>Buka di HP (Jaringan WiFi)</h4>
+              <p id="settingsIpDisplay">Scan QR Code atau buka di browser HP</p>
+            </div>
+            <button id="btnOpenQrModal" class="btn-action">Tampilkan QR</button>
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-info">
+              <h4>Mode Putar Default</h4>
+              <p>Audio lebih hemat kuota & baterai, Video untuk menonton klip</p>
+            </div>
+            <select id="selectDefaultMode" class="select-box">
+              <option value="audio">🎧 Audio Saja (Hemat Data)</option>
+              <option value="video">🎬 Video (MP4)</option>
+            </select>
+          </div>
+
+          <div class="settings-row">
+            <div class="settings-info">
+              <h4>Pengatur Waktu Tidur (Sleep Timer)</h4>
+              <p id="sleepTimerStatus">Mati (Tidak aktif)</p>
+            </div>
+            <button id="btnOpenSleepTimerModal" class="btn-action">Atur Timer</button>
+          </div>
+        </div>
+
+        <div class="settings-card mt-4">
+          <h4>Tentang Kedai Musik</h4>
+          <p class="about-desc">
+            Kedai Musik adalah pemutar musik modern berbasis YouTube dengan kemampuan streaming bebas iklan, hemat kuota data, dan dukungan pemutaran di latar belakang (background audio playback) saat layar ponsel mati.
+          </p>
+          <div class="feature-badges">
+            <span class="badge">✨ 100% Bebas Iklan</span>
+            <span class="badge">📱 Dukungan PWA</span>
+            <span class="badge">🔋 Hemat Baterai</span>
+            <span class="badge">🎤 Lirik Karaoke</span>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- Persistent Bottom Mini-Player -->
+    <div id="miniPlayer" class="mini-player hidden">
+      <div class="mini-progress-bar">
+        <div id="miniProgressLine" class="mini-progress-fill"></div>
+      </div>
+      <div class="mini-content" id="miniPlayerClickable">
+        <div class="mini-thumb-wrap">
+          <img id="miniThumb" src="/static/icons/favicon.svg" alt="Album Cover">
+          <div id="miniVisualizer" class="mini-bars hidden">
+            <span></span><span></span><span></span>
+          </div>
+        </div>
+        <div class="mini-text">
+          <div id="miniTitle" class="mini-title">Memilih lagu...</div>
+          <div id="miniArtist" class="mini-artist">Kedai Musik</div>
+        </div>
+      </div>
+      <div class="mini-controls">
+        <button id="miniBtnLike" class="icon-btn-sm" aria-label="Suka">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+          </svg>
+        </button>
+        <button id="miniBtnPlay" class="icon-btn-play-sm" aria-label="Putar / Jeda">
+          <svg id="miniPlayIcon" viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+        </button>
+        <button id="miniBtnNext" class="icon-btn-sm" aria-label="Selanjutnya">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+            <polygon points="5 4 15 12 5 20 5 4"/>
+            <line x1="19" y1="5" x2="19" y2="19" stroke="currentColor" stroke-width="2"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Bottom Navigation Bar (Mobile Native Style) -->
+    <nav class="bottom-nav">
+      <button class="nav-item active" data-tab="viewHome">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+          <polyline points="9 22 9 12 15 12 15 22"/>
+        </svg>
+        <span>Beranda</span>
+      </button>
+
+      <button class="nav-item" data-tab="viewSearch">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <span>Cari</span>
+      </button>
+
+      <button class="nav-item" data-tab="viewQueue">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>
+        </svg>
+        <span>Antrean</span>
+      </button>
+
+      <button class="nav-item" data-tab="viewFavorites">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+        </svg>
+        <span>Favorit</span>
+      </button>
+
+      <button class="nav-item" data-tab="viewSettings">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+        <span>Setelan</span>
+      </button>
+    </nav>
+
+    <!-- FULLSCREEN PLAYER MODAL (Slide up on mobile) -->
+    <div id="fullPlayerModal" class="full-player-modal">
+      <div class="player-drag-handle-wrap" id="playerDragHandle">
+        <div class="player-drag-handle"></div>
+      </div>
+
+      <!-- Top Player Bar -->
+      <div class="full-player-header">
+        <button id="btnCloseFullPlayer" class="icon-btn" aria-label="Tutup Player">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </button>
+
+        <!-- Audio / Video Mode Toggle Pill -->
+        <div class="mode-switch-pill">
+          <button id="btnModeAudio" class="mode-btn active">🎧 Musik</button>
+          <button id="btnModeVideo" class="mode-btn">🎬 Video</button>
+        </div>
+
+        <button id="btnToggleLyrics" class="icon-btn" aria-label="Lirik Lagu" title="Lirik Lagu">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Visual Area (Vinyl Artwork or Video Player) -->
+      <div class="player-display-area">
+        <!-- Audio Mode Display -->
+        <div id="audioDisplay" class="audio-display">
+          <div class="artwork-container">
+            <div id="vinylGlow" class="artwork-glow"></div>
+            <img id="fullArtwork" src="/static/icons/favicon.svg" alt="Album Cover" class="artwork-img">
+          </div>
+          <!-- Live Audio Visualizer Wave -->
+          <div class="wave-visualizer" id="waveVisualizer">
+            <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+            <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+            <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+          </div>
+        </div>
+
+        <!-- Video Mode Display (HTML5 Video Element) -->
+        <div id="videoDisplay" class="video-display hidden">
+          <video id="htmlVideoPlayer" playsinline webkit-playsinline controls preload="metadata"></video>
+        </div>
+      </div>
+
+      <!-- Song Meta Info -->
+      <div class="player-meta-wrap">
+        <div class="player-title-box">
+          <div id="fullPlayerTitle" class="full-title">Pilih Lagu</div>
+          <div id="fullPlayerArtist" class="full-artist">Kedai Musik</div>
+        </div>
+        <button id="btnFullLike" class="icon-btn-like" aria-label="Suka">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Progress / Seek Bar -->
+      <div class="player-progress-area">
+        <div class="seek-bar-container" id="seekBarContainer">
+          <div class="seek-track">
+            <div id="seekFill" class="seek-fill"></div>
+            <div id="seekThumb" class="seek-thumb"></div>
+          </div>
+        </div>
+        <div class="time-indicators">
+          <span id="currentTime">0:00</span>
+          <span id="totalDuration">0:00</span>
+        </div>
+      </div>
+
+      <!-- Main Playback Controls -->
+      <div class="player-controls-main">
+        <button id="btnShuffle" class="ctrl-btn-sm" aria-label="Acak" title="Acak Putar">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="16 3 21 3 21 8"/>
+            <line x1="4" y1="20" x2="21" y2="3"/>
+            <polyline points="21 16 21 21 16 21"/>
+            <line x1="15" y1="15" x2="21" y2="21"/>
+            <line x1="4" y1="4" x2="9" y2="9"/>
+          </svg>
+        </button>
+
+        <button id="btnPrev" class="ctrl-btn-nav" aria-label="Sebelumnya">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor">
+            <polygon points="19 20 9 12 19 4 19 20"/>
+            <line x1="5" y1="19" x2="5" y2="5" stroke="currentColor" stroke-width="2"/>
+          </svg>
+        </button>
+
+        <button id="btnFullPlay" class="ctrl-btn-play" aria-label="Putar / Jeda">
+          <div class="play-btn-spinner hidden" id="playerSpinner"></div>
+          <svg id="fullPlayIcon" viewBox="0 0 24 24" width="32" height="32" fill="currentColor">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+        </button>
+
+        <button id="btnNext" class="ctrl-btn-nav" aria-label="Selanjutnya">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor">
+            <polygon points="5 4 15 12 5 20 5 4"/>
+            <line x1="19" y1="5" x2="19" y2="19" stroke="currentColor" stroke-width="2"/>
+          </svg>
+        </button>
+
+        <button id="btnRepeat" class="ctrl-btn-sm" aria-label="Ulangi" title="Ulangi Lagu">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="17 1 21 5 17 9"/>
+            <path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+            <polyline points="7 23 3 19 7 15"/>
+            <path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+          </svg>
+          <span id="repeatBadge" class="repeat-badge hidden">1</span>
+        </button>
+      </div>
+
+      <!-- Extra Action Toolbar (Sleep Timer, Download, Speed) -->
+      <div class="player-extra-toolbar">
+        <button id="btnSleepTimer" class="extra-action-btn" title="Pengatur Waktu Tidur">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+          </svg>
+          <span id="sleepTimerBadge">Timer</span>
+        </button>
+
+        <button id="btnDownloadCurrent" class="extra-action-btn" title="Unduh Lagu ke HP">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          <span>Unduh</span>
+        </button>
+
+        <button id="btnPlaybackSpeed" class="extra-action-btn" title="Kecepatan Putar">
+          <span id="speedDisplay">1.0x</span>
+        </button>
+      </div>
+
+      <!-- Realtime Synced Lyrics Overlay / Sheet -->
+      <div id="lyricsSheet" class="lyrics-sheet hidden">
+        <div class="lyrics-header">
+          <h4>Lirik Lagu</h4>
+          <button id="btnCloseLyrics" class="icon-btn-sm" aria-label="Tutup Lirik">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18"/>
+              <line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+        <div id="lyricsContainer" class="lyrics-container">
+          <p class="lyrics-placeholder">Memuat lirik...</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Hidden HTML5 Audio Element for Background & Lockscreen Playback -->
+    <audio id="htmlAudioPlayer" preload="auto" playsinline webkit-playsinline></audio>
+
+    <!-- QR CODE / HP CONNECTION MODAL -->
+    <div id="modalQr" class="modal-overlay hidden">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h3>Buka Kedai Musik di HP</h3>
+          <button id="btnCloseQrModal" class="btn-close-modal">✕</button>
+        </div>
+        <div class="modal-body text-center">
+          <p class="modal-desc">
+            Arahkan kamera HP ke QR Code ini untuk membuka Kedai Musik secara instan di HP:
+          </p>
+          <div class="qr-image-wrapper">
+            <img id="qrCodeImg" src="data:image/png;base64,{{ qr_b64 }}" alt="QR Code HP">
+          </div>
+          <div class="url-copy-box">
+            <span id="mobileUrlText">{{ network_url }}</span>
+            <button id="btnCopyUrl" class="btn-copy">Salin</button>
+          </div>
+          <div style="margin-bottom: 12px; font-size: 0.74rem; color: #10b981; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.25); border-radius: 8px; padding: 8px 12px; text-align: left; line-height: 1.4;">
+            🔒 <b>Aman & Bebas Blokir:</b> Tautan ini dapat diakses langsung dari HP pada jaringan WiFi mana pun (termasuk WiFi kantor / hotspot) maupun paket data seluler.
+          </div>
+          <div class="pwa-tip">
+            💡 <b>Tips:</b> Setelah terbuka di HP, tekan menu browser lalu pilih <b>"Tambahkan ke Layar Utama"</b> (Add to Home screen) agar terpasang di HP seperti aplikasi resmi.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SLEEP TIMER MODAL -->
+    <div id="modalSleepTimer" class="modal-overlay hidden">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h3>Pengatur Waktu Tidur</h3>
+          <button id="btnCloseSleepModal" class="btn-close-modal">✕</button>
+        </div>
+        <div class="modal-body">
+          <p class="modal-desc">Musik akan otomatis berhenti setelah durasi yang Anda tentukan:</p>
+          <div class="timer-options">
+            <button class="timer-opt" data-minutes="15">15 Menit</button>
+            <button class="timer-opt" data-minutes="30">30 Menit</button>
+            <button class="timer-opt" data-minutes="45">45 Menit</button>
+            <button class="timer-opt" data-minutes="60">60 Menit</button>
+            <button class="timer-opt" data-minutes="end">Akhir Lagu Ini</button>
+            <button class="timer-opt danger-opt" data-minutes="0">Matikan Timer</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TOAST NOTIFICATION -->
+    <div id="toast" class="toast hidden"></div>
+
+  </div>
+
+  <!-- Main JavaScript App -->
+  <script src="/static/js/app.js?v=3"></script>
+</body>
+</html>
+
