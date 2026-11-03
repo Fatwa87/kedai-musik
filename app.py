@@ -546,6 +546,12 @@ def stream_media(video_id):
 
         if cr:
             response_headers['Content-Range'] = cr
+        elif status_code == 416:
+            # RFC 7233: a 416 should carry "Content-Range: bytes */TOTAL" so
+            # the player learns the real file size instead of dead-ending.
+            length_marker = upstream.headers.get('Content-Range', '').strip()
+            if length_marker.startswith('bytes */'):
+                response_headers['Content-Range'] = length_marker
         response_headers['Content-Length'] = str(response_bytes)
 
         return Response(upstream.content, status=status_code, headers=response_headers)

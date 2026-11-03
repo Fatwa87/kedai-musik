@@ -167,11 +167,46 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (e) {}
   }
 
+  // Safe "set src + resume at position" for mobile browsers.
+  // Assigning currentTime right after src= is a race condition on
+  // Android/iOS WebView: metadata is not loaded yet, so the seek throws or
+  // the element silently restarts from 0 (and play() can reject). This
+  // waits for 'loadedmetadata' before seeking.
+  function assignSrcAndSeek(media, url, resumeTime, resumePlay) {
+    media.src = url;
+    media.playbackRate = state.playbackSpeed;
+
+    const doSeek = () => {
+      try { media.currentTime = resumeTime || 0; } catch (e) {}
+      if (resumePlay) {
+        media.play()
+          .then(() => {
+            state.isPlaying = true;
+            updatePlaybackUI(true);
+          })
+          .catch(err => {
+            console.warn('Resume play error:', err);
+            state.isPlaying = false;
+            updatePlaybackUI(false);
+          });
+      }
+    };
+
+    if (media.readyState >= 1) {
+      // Metadata already available (e.g. mode switch while playing)
+      doSeek();
+    } else {
+      media.addEventListener('loadedmetadata', doSeek, { once: true });
+      // Also kick off the buffer so the spinner disappears as soon as possible
+      media.load();
+    }
+  }
+
   function playTrack(track, autoStart = true) {
     if (!track || !track.id) return;
     
-    audioEl._hasRetried = false;
-    videoEl._hasRetried = false;
+    audioEl._retries = 0;
+    videoEl._retries = 0;
     
     state.currentTrack = track;
     addToHistory(track);
@@ -183,42 +218,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (state.mode === 'video') {
       stopMediaElement(audioEl);
-
       const videoStreamUrl = `/api/stream/${track.id}?type=video`;
-      videoEl.src = videoStreamUrl;
-      videoEl.playbackRate = state.playbackSpeed;
-
-      if (autoStart) {
-        videoEl.play()
-          .then(() => {
-            state.isPlaying = true;
-            updatePlaybackUI(true);
-          })
-          .catch(err => {
-            console.warn('Video play error / user interaction required:', err);
-            state.isPlaying = false;
-            updatePlaybackUI(false);
-          });
-      }
+      assignSrcAndSeek(videoEl, videoStreamUrl, 0, autoStart);
     } else {
       stopMediaElement(videoEl);
-
       const audioStreamUrl = `/api/stream/${track.id}?type=audio`;
-      audioEl.src = audioStreamUrl;
-      audioEl.playbackRate = state.playbackSpeed;
-
-      if (autoStart) {
-        audioEl.play()
-          .then(() => {
-            state.isPlaying = true;
-            updatePlaybackUI(true);
-          })
-          .catch(err => {
-            console.warn('Audio play error / user interaction required:', err);
-            state.isPlaying = false;
-            updatePlaybackUI(false);
-          });
-      }
+      assignSrcAndSeek(audioEl, audioStreamUrl, 0, autoStart);
     }
 
     setupMediaSession(track);
@@ -376,14 +381,7 @@ document.addEventListener('DOMContentLoaded', () => {
       stopMediaElement(videoEl);
 
       if (state.currentTrack) {
-        audioEl.src = `/api/stream/${state.currentTrack.id}?type=audio`;
-        audioEl.currentTime = currentTime;
-        audioEl.playbackRate = state.playbackSpeed;
-        if (wasPlaying) {
-          audioEl.play().catch(console.error);
-          state.isPlaying = true;
-          updatePlaybackUI(true);
-        }
+        assignSrcAndSeek(audioEl, `/api/stream/${state.currentTrack.id}?type=audio`, currentTime, wasPlaying);
       }
     } else {
       btnModeVideo.classList.add('active');
@@ -394,14 +392,7 @@ document.addEventListener('DOMContentLoaded', () => {
       stopMediaElement(audioEl);
 
       if (state.currentTrack) {
-        videoEl.src = `/api/stream/${state.currentTrack.id}?type=video`;
-        videoEl.currentTime = currentTime;
-        videoEl.playbackRate = state.playbackSpeed;
-        if (wasPlaying) {
-          videoEl.play().catch(console.error);
-          state.isPlaying = true;
-          updatePlaybackUI(true);
-        }
+        assignSrcAndSeek(videoEl, `/api/stream/${state.currentTrack.id}?type=video`, currentTime, wasPlaying);
       }
     }
   }
@@ -503,22 +494,7 @@ document.addEventListener('DOMContentLoaded', () => {
         switchedToAudioForBackground = true;
 
         stopMediaElement(videoEl);
-
-        audioEl.src = `/api/stream/${state.currentTrack.id}?type=audio`;
-        audioEl.currentTime = currentPos;
-        audioEl.playbackRate = state.playbackSpeed;
-
-        audioEl.play()
-          .then(() => {
-            state.isPlaying = true;
-            updatePlaybackUI(true);
-            if ('mediaSession' in navigator) {
-              navigator.mediaSession.playbackState = 'playing';
-            }
-          })
-          .catch(err => {
-            console.warn('Background audio switch error:', err);
-          });
+        assignSrcAndSeek(audioEl, `/api/stream/${state.currentTrack.id}?type=audio`, currentPos, true);
       }
     } else {
       // Ponsel dibuka kembali / layar menyala
@@ -528,19 +504,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const wasPlaying = !audioEl.paused;
 
         stopMediaElement(audioEl);
-
-        videoEl.src = `/api/stream/${state.currentTrack.id}?type=video`;
-        videoEl.currentTime = currentPos;
-        videoEl.playbackRate = state.playbackSpeed;
-
-        if (wasPlaying) {
-          videoEl.play()
-            .then(() => {
-              state.isPlaying = true;
-              updatePlaybackUI(true);
-            })
-            .catch(console.error);
-        }
+        assignSrcAndSeek(videoEl, `/api/stream/${state.currentTrack.id}?type=video`, currentPos, wasPlaying);
       }
     }
   });
@@ -622,27 +586,28 @@ document.addEventListener('DOMContentLoaded', () => {
       // 4. If media is already actively playing, DO NOT show error!
       if (!media.paused && media.currentTime > 0) return;
 
-      // 5. Automatic self-healing retry on Vercel/cloud before showing error toast
-      if (!media._hasRetried && state.currentTrack) {
-        media._hasRetried = true;
-        console.warn('Playback error detected, retrying with fresh token...');
-        fetch(`/api/playback/${state.currentTrack.id}?type=${state.mode}`)
-          .then(res => res.json())
-          .then(data => {
-            if (data.success && data.proxy_url) {
-              media.src = `${data.proxy_url}&_r=${Date.now()}`;
-              media.play().catch(console.error);
-            } else {
-              playerSpinner.classList.add('hidden');
-              fullPlayIcon.classList.remove('hidden');
-              showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
-            }
-          })
-          .catch(() => {
-            playerSpinner.classList.add('hidden');
-            fullPlayIcon.classList.remove('hidden');
-            showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
-          });
+      // 5. Automatic self-healing retry (up to 3x) before showing error toast.
+      //    1st-2nd: refresh the proxy stream with a fresh token.
+      //    3rd: fall back to the direct Google CDN URL (bypasses proxy limits).
+      if (media._retries < 3 && state.currentTrack) {
+        media._retries = (media._retries || 0) + 1;
+        console.warn('Playback error detected, retry', media._retries, 'with fresh token...');
+
+        if (media._retries < 3) {
+          fetch(`/api/playback/${state.currentTrack.id}?type=${state.mode}`)
+            .then(res => res.json())
+            .then(data => {
+              if (data.success && data.proxy_url) {
+                media.src = `${data.proxy_url}&_r=${Date.now()}`;
+                media.play().catch(() => {});
+              } else {
+                tryDirectFallback(media);
+              }
+            })
+            .catch(() => tryDirectFallback(media));
+        } else {
+          tryDirectFallback(media);
+        }
         return;
       }
 
@@ -651,6 +616,28 @@ document.addEventListener('DOMContentLoaded', () => {
       fullPlayIcon.classList.remove('hidden');
       showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
     });
+
+    function tryDirectFallback(media) {
+      fetch(`/api/playback/${state.currentTrack.id}?type=${state.mode}`)
+        .then(res => res.json())
+        .then(data => {
+          if (data.success && data.url) {
+            // Bypass the proxy entirely — let the browser stream straight from
+            // Google CDN. This avoids any proxy payload/timeout caps.
+            media.src = data.url;
+            media.play().catch(() => {});
+          } else {
+            playerSpinner.classList.add('hidden');
+            fullPlayIcon.classList.remove('hidden');
+            showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
+          }
+        })
+        .catch(() => {
+          playerSpinner.classList.add('hidden');
+          fullPlayIcon.classList.remove('hidden');
+          showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
+        });
+    }
   });
 
   // ------------------------------------------------------------------------
