@@ -82,6 +82,33 @@ Selesai! Ikon **Kedai Musik** akan muncul di menu aplikasi HP Anda.
 
 ---
 
+## ☁️ Cara Deploy ke Cloud (Render.com) - 24 Jam Tanpa Laptop
+
+Aplikasi ini sudah siap untuk di-deploy ke **Render.com** (100% Gratis) sehingga Anda tidak perlu menyalakan laptop sama sekali:
+
+1. **Buat Repository Baru di GitHub**:
+   - Buka [github.com/new](https://github.com/new) dan beri nama repository, misalnya: `kedai-musik`.
+   - Pilih **Private** atau **Public**, lalu klik **Create repository**.
+2. **Push Kode dari Laptop**:
+   ```bash
+   git remote add origin https://github.com/USERNAME/kedai-musik.git
+   git push -u origin main
+   ```
+3. **Deploy di Render.com**:
+   - Buka [dashboard.render.com](https://dashboard.render.com/) dan login menggunakan akun GitHub Anda.
+   - Klik **New +** > Pilih **Web Service**.
+   - Pilih repository **kedai-musik** yang tadi dibuat.
+   - Konfigurasi:
+     - **Runtime**: `Python 3`
+     - **Build Command**: `pip install -r requirements.txt`
+     - **Start Command**: `gunicorn -w 1 --threads 8 --timeout 120 -b 0.0.0.0:$PORT app:app`
+     - **Plan**: `Free`
+   - Klik **Create Web Service**.
+4. **Selesai!**
+   Render akan memberikan tautan HTTPS permanen (contoh: `https://kedai-musik.onrender.com`). Anda bisa membuka dan meng-install aplikasi tersebut di HP Anda kapan saja tanpa laptop menyala.
+
+---
+
 ## 📁 Struktur Berkas
 
 ```
