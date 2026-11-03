@@ -154,7 +154,13 @@ def get_ydl_options(extract_flat=True, format_spec='140/251/18/bestaudio/best'):
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
-        'ignoreerrors': True
+        'ignoreerrors': True,
+        # Critical: YouTube bot-detection blocks datacenter IPs (Vercel/Render/HF)
+        # unless we send a real browser User-Agent + Referer to the player API.
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://www.youtube.com/'
+        }
     }
     if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
         opts['ffmpeg_location'] = FFMPEG_PATH
@@ -383,6 +389,7 @@ def get_stream_url(video_id, media_type='audio', force_refresh=False):
     client_configs = [
         {'player_client': ['ios', 'android', 'web']},
         {'player_client': ['android']},
+        {'player_client': ['ios']},
         {'player_client': ['web']}
     ]
 
@@ -399,7 +406,13 @@ def get_stream_url(video_id, media_type='audio', force_refresh=False):
                 'no_warnings': True,
                 'skip_download': True,
                 'format': format_spec,
-                'extractor_args': {'youtube': cfg}
+                'extractor_args': {'youtube': cfg},
+                # Same bot-detection bypass as get_ydl_options — without this,
+                # cloud IPs (Vercel/Render/HF Spaces) get blocked by YouTube.
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Referer': 'https://www.youtube.com/'
+                }
             }
             if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
                 ydl_opts['ffmpeg_location'] = FFMPEG_PATH
@@ -456,17 +469,32 @@ def stream_media(video_id):
         
         if range_header and range_header.startswith('bytes='):
             range_spec = range_header[6:].strip()
-            parts = range_spec.split('-')
-            if parts[0]:
+            # Handle suffix range: e.g. bytes=-32768 (requested by mobile browser for metadata)
+            if range_spec.startswith('-'):
                 try:
-                    start_byte = int(parts[0])
-                except ValueError:
+                    suffix_len = int(range_spec[1:])
+                    total_size = STREAM_CACHE.get(f"{video_id}_{media_type}_size")
+                    if not total_size:
+                        h = requests.head(stream_url, timeout=5)
+                        total_size = int(h.headers.get('Content-Length', 0))
+                        STREAM_CACHE[f"{video_id}_{media_type}_size"] = total_size
+                    if total_size and total_size > 0:
+                        start_byte = max(0, total_size - suffix_len)
+                        end_byte = total_size - 1
+                except Exception:
                     start_byte = 0
-            if len(parts) > 1 and parts[1]:
-                try:
-                    end_byte = int(parts[1])
-                except ValueError:
-                    end_byte = None
+            else:
+                parts = range_spec.split('-')
+                if parts[0]:
+                    try:
+                        start_byte = int(parts[0])
+                    except ValueError:
+                        start_byte = 0
+                if len(parts) > 1 and parts[1]:
+                    try:
+                        end_byte = int(parts[1])
+                    except ValueError:
+                        end_byte = None
 
         # Clamp chunk to MAX_CHUNK (1MB) to ensure sub-second response on Vercel
         if end_byte is None or (end_byte - start_byte + 1) > MAX_CHUNK:
@@ -483,12 +511,30 @@ def stream_media(video_id):
         upstream = requests.get(stream_url, headers=forward_headers, timeout=12)
         
         # If upstream token expired or returned 403/410, refresh stream URL
+        # NOTE: 416 (Range Not Satisfiable) is a NORMAL EOF case when the
+        # client asks for bytes past the file end — we must NOT treat it as
+        # "expired token" or we waste a re-extraction on every song end.
         if upstream.status_code in (403, 404, 410):
             STREAM_CACHE.pop(f"{video_id}_{media_type}", None)
             stream_url, mime_type = get_stream_url(video_id, media_type, force_refresh=True)
             upstream = requests.get(stream_url, headers=forward_headers, timeout=12)
 
         status_code = upstream.status_code
+        # Build a CORRECT Content-Length that matches the exact bytes we return.
+        # Copying Content-Length blindly from upstream is wrong when we clamped
+        # the request to MAX_CHUNK or when the file ended early: the browser
+        # then waits for bytes that never arrive (the classic "stuck spinner"
+        # / "track fails to load" bug on mobile).
+        cr = upstream.headers.get('Content-Range', '').strip()
+        if status_code == 206:
+            # upstream's Content-Range header (e.g. "bytes 1048576-2097151/8405914")
+            # describes exactly the bytes in the body, so keep it verbatim and
+            # only fix Content-Length to the actual payload size.
+            response_bytes = len(upstream.content)
+        else:
+            cr = None
+            response_bytes = len(upstream.content)
+
         response_headers = {
             'Content-Type': upstream.headers.get('Content-Type', mime_type),
             'Accept-Ranges': 'bytes',
@@ -498,10 +544,9 @@ def stream_media(video_id):
             'Cache-Control': 'public, max-age=3600'
         }
 
-        if 'Content-Range' in upstream.headers:
-            response_headers['Content-Range'] = upstream.headers['Content-Range']
-        if 'Content-Length' in upstream.headers:
-            response_headers['Content-Length'] = upstream.headers['Content-Length']
+        if cr:
+            response_headers['Content-Range'] = cr
+        response_headers['Content-Length'] = str(response_bytes)
 
         return Response(upstream.content, status=status_code, headers=response_headers)
 
