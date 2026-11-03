@@ -27,6 +27,10 @@ document.addEventListener('DOMContentLoaded', () => {
     searchQuery: '',
     searchLimit: 40,
     currentSearchResults: [],
+    isUsingYtFallback: false,
+    ytPlayer: null,
+    ytPlayerReady: false,
+    ytSyncInterval: null,
     deferredPrompt: null
   };
 
@@ -216,6 +220,15 @@ document.addEventListener('DOMContentLoaded', () => {
     playerSpinner.classList.remove('hidden');
     fullPlayIcon.classList.add('hidden');
 
+    if (state.isUsingYtFallback) {
+      fallbackToYouTubePlayer(track);
+      setupMediaSession(track);
+      fetchLyrics(track);
+      renderQueue();
+      renderFavorites();
+      return;
+    }
+
     if (state.mode === 'video') {
       stopMediaElement(audioEl);
       const videoStreamUrl = `/api/stream/${track.id}?type=video`;
@@ -236,6 +249,20 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!state.currentTrack) {
       if (state.queue.length > 0) {
         playTrack(state.queue[0]);
+      }
+      return;
+    }
+
+    if (state.isUsingYtFallback && state.ytPlayer && typeof state.ytPlayer.getPlayerState === 'function') {
+      const pState = state.ytPlayer.getPlayerState();
+      if (pState === YT.PlayerState.PLAYING) {
+        state.ytPlayer.pauseVideo();
+        state.isPlaying = false;
+        updatePlaybackUI(false);
+      } else {
+        state.ytPlayer.playVideo();
+        state.isPlaying = true;
+        updatePlaybackUI(true);
       }
       return;
     }
@@ -622,20 +649,14 @@ document.addEventListener('DOMContentLoaded', () => {
         .then(res => res.json())
         .then(data => {
           if (data.success && data.url) {
-            // Bypass the proxy entirely — let the browser stream straight from
-            // Google CDN. This avoids any proxy payload/timeout caps.
             media.src = data.url;
-            media.play().catch(() => {});
+            media.play().catch(() => fallbackToYouTubePlayer(state.currentTrack));
           } else {
-            playerSpinner.classList.add('hidden');
-            fullPlayIcon.classList.remove('hidden');
-            showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
+            fallbackToYouTubePlayer(state.currentTrack);
           }
         })
         .catch(() => {
-          playerSpinner.classList.add('hidden');
-          fullPlayIcon.classList.remove('hidden');
-          showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
+          fallbackToYouTubePlayer(state.currentTrack);
         });
     }
   });
@@ -651,6 +672,15 @@ document.addEventListener('DOMContentLoaded', () => {
     
     seekFill.style.width = `${pct * 100}%`;
     seekThumb.style.left = `${pct * 100}%`;
+
+    if (state.isUsingYtFallback && state.ytPlayer && typeof state.ytPlayer.getDuration === 'function') {
+      const dur = state.ytPlayer.getDuration() || 0;
+      if (dur > 0) {
+        state.ytPlayer.seekTo(pct * dur, true);
+        currentTimeEl.textContent = formatDuration(pct * dur);
+      }
+      return;
+    }
 
     const activeMedia = getActiveMediaElement();
     if (activeMedia.duration) {
@@ -1475,6 +1505,152 @@ document.addEventListener('DOMContentLoaded', () => {
     state.deferredPrompt = null;
     btnInstallPwa.classList.add('hidden');
   });
+
+  // ------------------------------------------------------------------------
+  // YouTube IFrame API Fallback Controller (Bypasses Cloud Datacenter Blocking!)
+  // ------------------------------------------------------------------------
+  function startYtSync() {
+    clearInterval(state.ytSyncInterval);
+    state.ytSyncInterval = setInterval(() => {
+      if (!state.isUsingYtFallback || !state.ytPlayer || typeof state.ytPlayer.getCurrentTime !== 'function') {
+        return;
+      }
+      try {
+        const cur = state.ytPlayer.getCurrentTime() || 0;
+        const dur = state.ytPlayer.getDuration() || 0;
+        if (dur > 0 && !isSeeking) {
+          const pct = (cur / dur) * 100;
+          seekFill.style.width = `${pct}%`;
+          seekThumb.style.left = `${pct}%`;
+          miniProgressLine.style.width = `${pct}%`;
+          currentTimeEl.textContent = formatDuration(cur);
+          totalDurationEl.textContent = formatDuration(dur);
+        }
+        syncLyricsWithTime(cur);
+      } catch (err) {}
+    }, 250);
+  }
+
+  function fallbackToYouTubePlayer(track) {
+    if (!track || !track.id) return;
+    console.warn('Backend proxy restricted by cloud IP. Activating client-side YouTube player...');
+    state.isUsingYtFallback = true;
+    
+    stopMediaElement(audioEl);
+    stopMediaElement(videoEl);
+
+    playerSpinner.classList.remove('hidden');
+    fullPlayIcon.classList.add('hidden');
+
+    const ytContainer = document.getElementById('ytPlayerContainer');
+    const ytAudioCont = document.getElementById('ytAudioContainer');
+    const ytWrapper = document.getElementById('ytPlayerWrapper');
+
+    if (state.mode === 'video') {
+      if (ytContainer) ytContainer.style.display = 'block';
+    } else {
+      if (ytContainer) ytContainer.style.display = 'none';
+    }
+
+    function doPlay() {
+      try {
+        if (state.mode === 'video' && ytWrapper) {
+          const iframe = state.ytPlayer.getIframe();
+          if (iframe && iframe.parentNode !== ytWrapper) {
+            ytWrapper.appendChild(iframe);
+          }
+        } else if (ytAudioCont) {
+          const iframe = state.ytPlayer.getIframe();
+          if (iframe && iframe.parentNode !== ytAudioCont) {
+            ytAudioCont.appendChild(iframe);
+          }
+        }
+
+        state.ytPlayer.loadVideoById({
+          videoId: track.id,
+          startSeconds: 0
+        });
+        state.ytPlayer.playVideo();
+        startYtSync();
+        playerSpinner.classList.add('hidden');
+        fullPlayIcon.classList.remove('hidden');
+        updatePlaybackUI(true);
+        showToast('🎶 Memutar via pemutar cloud langsung...');
+      } catch (err) {
+        console.error('YT play error:', err);
+      }
+    }
+
+    if (state.ytPlayer && state.ytPlayerReady && typeof state.ytPlayer.loadVideoById === 'function') {
+      doPlay();
+    } else {
+      let tries = 0;
+      const readyWatcher = setInterval(() => {
+        tries++;
+        if (state.ytPlayer && typeof state.ytPlayer.loadVideoById === 'function') {
+          clearInterval(readyWatcher);
+          doPlay();
+        } else if (tries > 25) {
+          clearInterval(readyWatcher);
+          playerSpinner.classList.add('hidden');
+          fullPlayIcon.classList.remove('hidden');
+          showToast('⚠️ Gagal memutar lagu, coba pilih lagu lain.');
+        }
+      }, 200);
+    }
+  }
+
+  window.onYouTubeIframeAPIReady = function() {
+    try {
+      state.ytPlayer = new YT.Player('ytAudioPlayer', {
+        height: '100%',
+        width: '100%',
+        playerVars: {
+          autoplay: 0,
+          controls: 1,
+          rel: 0,
+          playsinline: 1,
+          enablejsapi: 1,
+          origin: window.location.origin
+        },
+        events: {
+          onReady: () => {
+            state.ytPlayerReady = true;
+          },
+          onStateChange: (event) => {
+            if (event.data === YT.PlayerState.PLAYING) {
+              state.isPlaying = true;
+              updatePlaybackUI(true);
+              startYtSync();
+            } else if (event.data === YT.PlayerState.PAUSED) {
+              state.isPlaying = false;
+              updatePlaybackUI(false);
+            } else if (event.data === YT.PlayerState.ENDED) {
+              if (state.sleepAtSongEnd) {
+                state.sleepAtSongEnd = false;
+                showToast('💤 Waktu tidur tiba, musik berhenti.');
+                return;
+              }
+              if (state.repeatMode === 'one') {
+                state.ytPlayer.seekTo(0, true);
+                state.ytPlayer.playVideo();
+              } else {
+                playNextTrack();
+              }
+            }
+          },
+          onError: (e) => {
+            console.warn('YouTube Player API error code:', e.data);
+            playerSpinner.classList.add('hidden');
+            fullPlayIcon.classList.remove('hidden');
+            showToast('⚠️ Gagal memutar track dari YouTube.');
+          }
+        }
+      });
+    } catch (e) {
+      console.warn('YT Iframe API init error:', e);
+    }
+  };
 
   // ------------------------------------------------------------------------
   // Initial Boot
