@@ -1,3 +1,13 @@
+---
+title: Kedai Musik
+emoji: 🎵
+colorFrom: purple
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # 🎵 Kedai Musik - Pemutar Musik & Video YouTube Bebas Iklan untuk HP
 
 Aplikasi pemutar musik dan video modern untuk HP (*mobile-first*) yang terhubung langsung ke sumber YouTube. Dirancang khusus untuk memberikan pengalaman mendengarkan musik premium **100% Bebas Iklan (No Ads)**, hemat kuota internet, dan dapat memutar musik di latar belakang (*background playback*) saat layar HP dimatikan atau saat membuka aplikasi lain (WhatsApp, Instagram, dll).
