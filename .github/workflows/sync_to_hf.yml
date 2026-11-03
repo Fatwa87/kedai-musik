@@ -21,3 +21,4 @@ jobs:
           else
             echo "HF_TOKEN secret is not set, skipping automatic sync."
           fi
+

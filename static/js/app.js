@@ -24,6 +24,9 @@ document.addEventListener('DOMContentLoaded', () => {
     syncedLyrics: [],
     plainLyrics: '',
     currentCategory: 'indo',
+    searchQuery: '',
+    searchLimit: 40,
+    currentSearchResults: [],
     deferredPrompt: null
   };
 
@@ -166,6 +169,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function playTrack(track, autoStart = true) {
     if (!track || !track.id) return;
+    
+    audioEl._hasRetried = false;
+    videoEl._hasRetried = false;
     
     state.currentTrack = track;
     addToHistory(track);
@@ -616,10 +622,34 @@ document.addEventListener('DOMContentLoaded', () => {
       // 4. If media is already actively playing, DO NOT show error!
       if (!media.paused && media.currentTime > 0) return;
 
+      // 5. Automatic self-healing retry on Vercel/cloud before showing error toast
+      if (!media._hasRetried && state.currentTrack) {
+        media._hasRetried = true;
+        console.warn('Playback error detected, retrying with fresh token...');
+        fetch(`/api/playback/${state.currentTrack.id}?type=${state.mode}`)
+          .then(res => res.json())
+          .then(data => {
+            if (data.success && data.proxy_url) {
+              media.src = `${data.proxy_url}&_r=${Date.now()}`;
+              media.play().catch(console.error);
+            } else {
+              playerSpinner.classList.add('hidden');
+              fullPlayIcon.classList.remove('hidden');
+              showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
+            }
+          })
+          .catch(() => {
+            playerSpinner.classList.add('hidden');
+            fullPlayIcon.classList.remove('hidden');
+            showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
+          });
+        return;
+      }
+
       console.warn('Active media error code:', code);
       playerSpinner.classList.add('hidden');
       fullPlayIcon.classList.remove('hidden');
-      showToast('⚠️ Gagal memutar track, silakan pilih lagu lain.');
+      showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
     });
   });
 
@@ -856,47 +886,100 @@ document.addEventListener('DOMContentLoaded', () => {
   // ------------------------------------------------------------------------
   // Search Controller
   // ------------------------------------------------------------------------
-  function executeSearch(query) {
+  function executeSearch(query, isLoadMore = false) {
     if (!query) return;
     
-    if (!state.searchHistory.includes(query)) {
-      state.searchHistory.unshift(query);
-      if (state.searchHistory.length > 8) state.searchHistory.pop();
-      localStorage.setItem('kedaimusik_search_history', JSON.stringify(state.searchHistory));
-      localStorage.setItem('vibetube_search_history', JSON.stringify(state.searchHistory));
-      renderSearchHistory();
+    if (!isLoadMore) {
+      state.searchQuery = query;
+      state.searchLimit = 50;
+      state.currentSearchResults = [];
+
+      if (!state.searchHistory.includes(query)) {
+        state.searchHistory.unshift(query);
+        if (state.searchHistory.length > 8) state.searchHistory.pop();
+        localStorage.setItem('kedaimusik_search_history', JSON.stringify(state.searchHistory));
+        localStorage.setItem('vibetube_search_history', JSON.stringify(state.searchHistory));
+        renderSearchHistory();
+      }
+
+      suggestionsList.classList.add('hidden');
+      searchSuggestionsBox.classList.add('hidden');
+      searchResultsSection.classList.remove('hidden');
+
+      searchResultsList.innerHTML = `
+        <div class="skeleton-list">
+          <div class="skeleton-item"></div>
+          <div class="skeleton-item"></div>
+          <div class="skeleton-item"></div>
+          <div class="skeleton-item"></div>
+        </div>
+      `;
     }
 
-    suggestionsList.classList.add('hidden');
-    searchSuggestionsBox.classList.add('hidden');
-    searchResultsSection.classList.remove('hidden');
+    const currentLimit = state.searchLimit;
 
-    searchResultsList.innerHTML = `
-      <div class="skeleton-list">
-        <div class="skeleton-item"></div>
-        <div class="skeleton-item"></div>
-        <div class="skeleton-item"></div>
-      </div>
-    `;
-
-    fetch(`/api/search?q=${encodeURIComponent(query)}`)
+    fetch(`/api/search?q=${encodeURIComponent(query)}&limit=${currentLimit}`)
       .then(res => res.json())
       .then(results => {
         if (!results || results.length === 0 || results.error) {
-          searchResultsList.innerHTML = '<div class="empty-state"><p>Lagu tidak ditemukan.</p></div>';
-          resultsCount.textContent = '0 lagu';
+          if (!isLoadMore) {
+            searchResultsList.innerHTML = '<div class="empty-state"><p>Lagu tidak ditemukan.</p></div>';
+            resultsCount.textContent = '0 lagu';
+          }
           return;
         }
 
-        resultsCount.textContent = `${results.length} lagu`;
+        state.currentSearchResults = results;
+        resultsCount.textContent = `${results.length} lagu ditemukan`;
+
         renderSongList(results, searchResultsList, (track) => {
           state.queue = [...results];
           playTrack(track);
         });
+
+        // Tombol Muat Lebih Banyak Lagu (seberapa adanya hasil di YouTube)
+        if (results.length >= 20 && results.length < 100) {
+          const loadMoreContainer = document.createElement('div');
+          loadMoreContainer.className = 'load-more-container';
+          loadMoreContainer.style.padding = '20px 0 32px 0';
+          loadMoreContainer.style.textAlign = 'center';
+
+          const loadMoreBtn = document.createElement('button');
+          loadMoreBtn.className = 'btn-load-more';
+          loadMoreBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle; margin-right:6px;">
+              <polyline points="7 13 12 18 17 13"/>
+              <polyline points="7 6 12 11 17 6"/>
+            </svg>
+            Tampilkan Lebih Banyak Lagu (${results.length}+)
+          `;
+          loadMoreBtn.style.background = 'linear-gradient(135deg, rgba(124, 58, 237, 0.3), rgba(236, 72, 153, 0.3))';
+          loadMoreBtn.style.border = '1px solid rgba(167, 139, 250, 0.5)';
+          loadMoreBtn.style.color = '#ffffff';
+          loadMoreBtn.style.padding = '12px 28px';
+          loadMoreBtn.style.borderRadius = '999px';
+          loadMoreBtn.style.fontSize = '14px';
+          loadMoreBtn.style.fontWeight = '600';
+          loadMoreBtn.style.cursor = 'pointer';
+          loadMoreBtn.style.boxShadow = '0 4px 15px rgba(124, 58, 237, 0.3)';
+          loadMoreBtn.style.transition = 'all 0.2s ease';
+
+          loadMoreBtn.addEventListener('click', () => {
+            loadMoreBtn.disabled = true;
+            loadMoreBtn.innerHTML = '⏳ Sedang memuat lagu tambahan...';
+            state.searchLimit += 30;
+            executeSearch(state.searchQuery, true);
+          });
+
+          loadMoreContainer.appendChild(loadMoreBtn);
+          searchResultsList.appendChild(loadMoreContainer);
+        }
       })
       .catch(err => {
         console.error('Search error:', err);
-        searchResultsList.innerHTML = '<div class="empty-state"><p>Pencarian gagal, coba lagi.</p></div>';
+        if (!isLoadMore) {
+          searchResultsList.innerHTML = '<div class="empty-state"><p>Pencarian gagal, coba lagi.</p></div>';
+        }
       });
   }
 

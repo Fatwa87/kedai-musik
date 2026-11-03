@@ -19,7 +19,7 @@ except Exception:
     pass
 
 from urllib.parse import quote
-from flask import Flask, request, jsonify, render_template, Response, send_file, send_from_directory
+from flask import Flask, request, jsonify, render_template, Response, send_file, send_from_directory, redirect
 import requests
 import yt_dlp
 import imageio_ffmpeg
@@ -35,8 +35,14 @@ IS_RENDER = os.environ.get('RENDER') is not None
 PUBLIC_URL = os.environ.get('RENDER_EXTERNAL_URL') if IS_RENDER else None
 CLOUDFLARED_PROC = None
 
-# Configure ffmpeg path
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+# Max chunk size (1MB) ensures sub-second responses and avoids Vercel 4.5MB payload limit
+MAX_CHUNK = 1024 * 1024
+
+# Configure ffmpeg path safely (compatible with Vercel serverless / read-only environment)
+try:
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    FFMPEG_PATH = None
 
 # Thread-safe in-memory caches
 STREAM_CACHE = {}     # key: f"{video_id}_{type}" -> (url, expiry_timestamp, content_type)
@@ -143,13 +149,15 @@ def start_cloudflared_tunnel():
 # Launch Cloudflare tunnel thread
 threading.Thread(target=start_cloudflared_tunnel, daemon=True).start()
 
-def get_ydl_options(extract_flat=True, format_spec='140/251/bestaudio[ext=m4a]/bestaudio/best'):
+def get_ydl_options(extract_flat=True, format_spec='140/251/18/bestaudio/best'):
     opts = {
         'quiet': True,
         'no_warnings': True,
-        'ffmpeg_location': FFMPEG_PATH,
-        'js_runtimes': {'node': {}}
+        'skip_download': True,
+        'ignoreerrors': True
     }
+    if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
+        opts['ffmpeg_location'] = FFMPEG_PATH
     if extract_flat:
         opts['extract_flat'] = True
     else:
@@ -225,8 +233,14 @@ def search():
     if not query:
         return jsonify([])
 
+    try:
+        limit = int(request.args.get('limit', 50))
+    except (ValueError, TypeError):
+        limit = 50
+    limit = max(10, min(limit, 100))
+
     now = time.time()
-    cache_key = query.lower()
+    cache_key = f"{query.lower()}_{limit}"
     if cache_key in SEARCH_CACHE:
         cached_res, exp = SEARCH_CACHE[cache_key]
         if now < exp:
@@ -235,7 +249,7 @@ def search():
     try:
         ydl_opts = get_ydl_options(extract_flat=True)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            res = ydl.extract_info(f"ytsearch20:{query}", download=False)
+            res = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
             entries = res.get('entries', []) or []
             
             clean_entries = []
@@ -352,59 +366,82 @@ def video_info(video_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-def get_stream_url(video_id, media_type='audio'):
+def get_stream_url(video_id, media_type='audio', force_refresh=False):
     """
-    Extract direct stream URL from YouTube using yt-dlp with caching.
-    - audio: uses pure audio (140=m4a AAC, 251=webm Opus) with web client.
-    - video: uses android client format 18 (MP4 with 360p/480p video + audio combined).
+    Extract direct stream URL from YouTube using yt-dlp with multiple client fallbacks.
+    - audio: uses pure audio (140=m4a AAC, 251=webm Opus) or format 18.
+    - video: uses format 18 (progressive MP4 with audio + video combined).
     """
     cache_key = f"{video_id}_{media_type}"
     now = time.time()
     
-    if cache_key in STREAM_CACHE:
+    if not force_refresh and cache_key in STREAM_CACHE:
         url, exp, mime = STREAM_CACHE[cache_key]
         if now < exp:
             return url, mime
 
+    client_configs = [
+        {'player_client': ['ios', 'android', 'web']},
+        {'player_client': ['android']},
+        {'player_client': ['web']}
+    ]
+
     if media_type == 'audio':
-        format_spec = '140/251/bestaudio[ext=m4a]/bestaudio/best'
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'ffmpeg_location': FFMPEG_PATH,
-            'js_runtimes': {'node': {}},
-            'format': format_spec
-        }
+        format_spec = '140/251/18/bestaudio[ext=m4a]/bestaudio/best'
     else:
-        # Video mode: Use android client format 18 for progressive MP4 (audio + video combined)
         format_spec = '18/best'
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'ffmpeg_location': FFMPEG_PATH,
-            'js_runtimes': {'node': {}},
-            'extractor_args': {'youtube': {'player_client': ['android']}},
-            'format': format_spec
-        }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-        stream_url = info.get('url')
-        
-        ext = info.get('ext', '')
-        if media_type == 'audio':
-            mime = 'audio/mp4' if ext in ['m4a', 'mp4', 'aac'] else 'audio/webm'
-        else:
-            mime = 'video/mp4'
-            
-        STREAM_CACHE[cache_key] = (stream_url, now + 10800, mime)  # 3 hours TTL
-        return stream_url, mime
+
+    last_err = None
+    for cfg in client_configs:
+        try:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+                'format': format_spec,
+                'extractor_args': {'youtube': cfg}
+            }
+            if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
+                ydl_opts['ffmpeg_location'] = FFMPEG_PATH
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                stream_url = info.get('url')
+                if stream_url:
+                    ext = info.get('ext', '')
+                    if media_type == 'audio':
+                        mime = 'audio/mp4' if ext in ['m4a', 'mp4', 'aac'] else 'audio/webm'
+                    else:
+                        mime = 'video/mp4'
+
+                    STREAM_CACHE[cache_key] = (stream_url, now + 10800, mime)
+                    return stream_url, mime
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise Exception(f"Gagal mengekstrak stream YouTube: {last_err}")
+
+@app.route('/api/playback/<video_id>')
+def playback_info(video_id):
+    media_type = request.args.get('type', 'audio').lower()
+    try:
+        stream_url, mime_type = get_stream_url(video_id, media_type)
+        return jsonify({
+            'success': True,
+            'url': stream_url,
+            'mime': mime_type,
+            'proxy_url': f'/api/stream/{video_id}?type={media_type}'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/stream/<video_id>')
 def stream_media(video_id):
     """
-    Robust stream proxy supporting HTTP 206 Partial Content (Range requests).
-    Guarantees 100% ad-free audio/video playback and seamless seeking on all mobile browsers!
+    Ultra-reliable stream proxy supporting HTTP 206 Partial Content (Range requests).
+    Chunks data in max 1MB blocks to guarantee 100% compatibility with Vercel,
+    Render, Cloudflare, and mobile browsers without timeouts or payload limits.
     """
     media_type = request.args.get('type', 'audio').lower()
     try:
@@ -413,15 +450,44 @@ def stream_media(video_id):
             return jsonify({'error': 'Stream URL not found'}), 404
 
         range_header = request.headers.get('Range')
-        forward_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        if range_header:
-            forward_headers['Range'] = range_header
-
-        # Stream request from GoogleVideo CDN
-        upstream = requests.get(stream_url, headers=forward_headers, stream=True, timeout=12)
         
+        start_byte = 0
+        end_byte = None
+        
+        if range_header and range_header.startswith('bytes='):
+            range_spec = range_header[6:].strip()
+            parts = range_spec.split('-')
+            if parts[0]:
+                try:
+                    start_byte = int(parts[0])
+                except ValueError:
+                    start_byte = 0
+            if len(parts) > 1 and parts[1]:
+                try:
+                    end_byte = int(parts[1])
+                except ValueError:
+                    end_byte = None
+
+        # Clamp chunk to MAX_CHUNK (1MB) to ensure sub-second response on Vercel
+        if end_byte is None or (end_byte - start_byte + 1) > MAX_CHUNK:
+            requested_end = start_byte + MAX_CHUNK - 1
+        else:
+            requested_end = end_byte
+
+        forward_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Range': f'bytes={start_byte}-{requested_end}'
+        }
+
+        # Request chunk from GoogleVideo CDN
+        upstream = requests.get(stream_url, headers=forward_headers, timeout=12)
+        
+        # If upstream token expired or returned 403/410, refresh stream URL
+        if upstream.status_code in (403, 404, 410):
+            STREAM_CACHE.pop(f"{video_id}_{media_type}", None)
+            stream_url, mime_type = get_stream_url(video_id, media_type, force_refresh=True)
+            upstream = requests.get(stream_url, headers=forward_headers, timeout=12)
+
         status_code = upstream.status_code
         response_headers = {
             'Content-Type': upstream.headers.get('Content-Type', mime_type),
@@ -429,7 +495,7 @@ def stream_media(video_id):
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Headers': 'Range, Content-Type, Accept',
             'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges',
-            'Cache-Control': 'no-cache'
+            'Cache-Control': 'public, max-age=3600'
         }
 
         if 'Content-Range' in upstream.headers:
@@ -437,17 +503,7 @@ def stream_media(video_id):
         if 'Content-Length' in upstream.headers:
             response_headers['Content-Length'] = upstream.headers['Content-Length']
 
-        def generate_chunks():
-            try:
-                for chunk in upstream.iter_content(chunk_size=65536):
-                    if chunk:
-                        yield chunk
-            except Exception as stream_err:
-                pass
-            finally:
-                upstream.close()
-
-        return Response(generate_chunks(), status=status_code, headers=response_headers)
+        return Response(upstream.content, status=status_code, headers=response_headers)
 
     except Exception as e:
         print("Stream error:", e)
@@ -499,30 +555,10 @@ def lyrics():
 
 @app.route('/api/download/<video_id>')
 def download_track(video_id):
-    """Download audio stream file directly to mobile phone storage."""
-    title = request.args.get('title', 'music').strip()
-    clean_name = re.sub(r'[\\/*?:"<>|]', "", title) or f"track_{video_id}"
-    filename = f"{clean_name}.m4a"
-    
+    """Download audio stream file directly to mobile phone storage (Vercel & cloud compatible)."""
     try:
         stream_url, _ = get_stream_url(video_id, 'audio')
-        upstream = requests.get(stream_url, stream=True, timeout=12)
-        
-        headers = {
-            'Content-Type': 'audio/mp4',
-            'Content-Disposition': f'attachment; filename="{filename}"',
-            'Content-Length': upstream.headers.get('Content-Length')
-        }
-        
-        def generate():
-            try:
-                for chunk in upstream.iter_content(chunk_size=65536):
-                    if chunk:
-                        yield chunk
-            finally:
-                upstream.close()
-
-        return Response(generate(), headers=headers)
+        return redirect(stream_url, code=302)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
