@@ -6,6 +6,7 @@ import socket
 import re
 import io
 import base64
+import ipaddress
 import subprocess
 import threading
 
@@ -18,7 +19,7 @@ try:
 except Exception:
     pass
 
-from urllib.parse import quote
+from urllib.parse import quote, parse_qs, urlparse
 from flask import Flask, request, jsonify, render_template, Response, send_file, send_from_directory, redirect
 import requests
 import yt_dlp
@@ -35,8 +36,9 @@ IS_RENDER = os.environ.get('RENDER') is not None
 PUBLIC_URL = os.environ.get('RENDER_EXTERNAL_URL') if IS_RENDER else None
 CLOUDFLARED_PROC = None
 
-# Max chunk size (1MB) ensures sub-second responses and avoids Vercel 4.5MB payload limit
-MAX_CHUNK = 1024 * 1024
+# Max chunk size (2MB) keeps responses below Vercel's 4.5MB payload limit while
+# reducing the number of round-trips for the proxy fallback.
+MAX_CHUNK = 2 * 1024 * 1024
 
 # Configure ffmpeg path safely (compatible with Vercel serverless / read-only environment)
 try:
@@ -45,10 +47,22 @@ except Exception:
     FFMPEG_PATH = None
 
 # Thread-safe in-memory caches
-STREAM_CACHE = {}     # key: f"{video_id}_{type}" -> (url, expiry_timestamp, content_type)
-SEARCH_CACHE = {}     # key: query_str -> (results, expiry_timestamp)
-TRENDING_CACHE = {}   # key: category -> (results, expiry_timestamp)
-LYRICS_CACHE = {}     # key: f"{title}_{artist}" -> lyrics_data
+STREAM_CACHE = {}       # key: f"{video_id}_{type}" -> (url, expiry_timestamp, content_type)
+STREAM_SIZE_CACHE = {}  # key: f"{video_id}_{type}" -> total bytes (from Content-Range)
+STREAM_LOCKS = {}       # key: f"{video_id}_{type}" -> threading.Lock (avoids duplicate extraction)
+STREAM_LOCKS_GUARD = threading.Lock()
+SEARCH_CACHE = {}       # key: query_str -> (results, expiry_timestamp)
+TRENDING_CACHE = {}     # key: category -> (results, expiry_timestamp)
+LYRICS_CACHE = {}       # key: f"{title}_{artist}" -> lyrics_data
+
+def get_stream_lock(key):
+    """Return a per-stream lock so parallel requests share one yt-dlp extraction."""
+    with STREAM_LOCKS_GUARD:
+        lock = STREAM_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            STREAM_LOCKS[key] = lock
+        return lock
 
 def get_local_ip():
     """Find the local WiFi / LAN IP of this computer."""
@@ -101,18 +115,24 @@ def clean_song_title(title):
     return cleaned
 
 def generate_qr_base64(url):
-    """Generate a base64 encoded PNG QR code."""
+    """
+    Generate a base64 encoded PNG QR code.
+
+    IMPORTANT: use pure black modules on a pure white background with a wide
+    quiet zone. Dark/inverted QR codes (the old purple-on-black style) look
+    nice but most phone camera apps simply refuse to decode them.
+    """
     qr = qrcode.QRCode(
-        version=1,
+        version=None,  # let qrcode choose the smallest version that fits
         error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=8,
-        border=2,
+        box_size=10,
+        border=4,      # standard 4-module quiet zone required by scanners
     )
     qr.add_data(url)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="#7c3aed", back_color="#090a10")
+    img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
     buf = io.BytesIO()
-    img.save(buf, format='PNG')
+    img.save(buf, format='PNG', optimize=True)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
 def start_cloudflared_tunnel():
@@ -155,6 +175,8 @@ def get_ydl_options(extract_flat=True, format_spec='140/251/18/bestaudio/best'):
         'no_warnings': True,
         'skip_download': True,
         'ignoreerrors': True,
+        'noplaylist': True,
+        'socket_timeout': 15,
         # Critical: YouTube bot-detection blocks datacenter IPs (Vercel/Render/HF)
         # unless we send a real browser User-Agent + Referer to the player API.
         'http_headers': {
@@ -170,23 +192,63 @@ def get_ydl_options(extract_flat=True, format_spec='140/251/18/bestaudio/best'):
         opts['format'] = format_spec
     return opts
 
-@app.route('/')
-def index():
+def is_private_hostname(hostname):
+    """True for localhost / LAN / loopback hosts (not reachable from the internet)."""
+    if not hostname:
+        return True
+    hostname = hostname.lower().strip('[]')
+    if hostname in ('localhost', '127.0.0.1', '0.0.0.0', '::1'):
+        return True
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        return hostname.endswith('.local') or hostname.endswith('.lan')
+
+def resolve_share_url():
+    """
+    Figure out the URL that a phone should open.
+
+    - Local Windows + Cloudflare Tunnel -> use the public trycloudflare.com URL.
+    - Vercel / Hugging Face / any real domain -> use the current request host.
+      (The old code only handled Render, so the QR code pointed at an
+      unreachable local/LAN IP on Vercel and Hugging Face.)
+    - Localhost on the same PC -> use the LAN IP so the phone can connect.
+    """
     local_ip = get_local_ip()
     local_url = f"http://{local_ip}:{PORT}"
-    
-    if IS_RENDER:
-        target_url = os.environ.get('RENDER_EXTERNAL_URL') or request.host_url.rstrip('/')
-    else:
-        target_url = PUBLIC_URL if PUBLIC_URL else local_url
 
+    if PUBLIC_URL:
+        return PUBLIC_URL, local_url, True
+
+    if IS_RENDER:
+        target = os.environ.get('RENDER_EXTERNAL_URL') or request.host_url.rstrip('/')
+        return target, local_url, True
+
+    hostname = urlparse(request.host_url).hostname
+    if not is_private_hostname(hostname):
+        # Running behind a public domain / reverse proxy (Vercel, HF Spaces, etc.)
+        # Hugging Face / Vercel may not pass X-Forwarded-Proto through Flask,
+        # so default to https for public hosts rather than generating an
+        # http:// QR code that the phone has to redirect through.
+        scheme = (request.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
+        if scheme not in ('http', 'https'):
+            scheme = 'https'
+        target = f"{scheme}://{request.host}"
+        return target, local_url, True
+
+    return local_url, local_url, False
+
+@app.route('/')
+def index():
+    target_url, local_url, is_public = resolve_share_url()
     qr_b64 = generate_qr_base64(target_url)
     return render_template('index.html', 
                            network_url=target_url, 
                            local_url=local_url,
-                           public_url=target_url if (IS_RENDER or PUBLIC_URL) else None,
+                           public_url=target_url if is_public else None,
                            qr_b64=qr_b64, 
-                           local_ip=local_ip, 
+                           local_ip=get_local_ip(), 
                            port=PORT)
 
 @app.route('/manifest.json')
@@ -199,21 +261,12 @@ def service_worker():
 
 @app.route('/api/network-info')
 def network_info():
-    local_ip = get_local_ip()
-    local_url = f"http://{local_ip}:{PORT}"
-    
-    if IS_RENDER:
-        target_url = os.environ.get('RENDER_EXTERNAL_URL') or request.host_url.rstrip('/')
-        pub_url = target_url
-    else:
-        target_url = PUBLIC_URL if PUBLIC_URL else local_url
-        pub_url = PUBLIC_URL
-
+    target_url, local_url, is_public = resolve_share_url()
     return jsonify({
-        'ip': local_ip,
+        'ip': get_local_ip(),
         'port': PORT,
         'local_url': local_url,
-        'public_url': pub_url,
+        'public_url': target_url if is_public else None,
         'url': target_url,
         'qr': generate_qr_base64(target_url)
     })
@@ -372,31 +425,36 @@ def video_info(video_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-def get_stream_url(video_id, media_type='audio', force_refresh=False):
+def extract_stream_url(video_id, media_type='audio'):
     """
-    Extract direct stream URL from YouTube using yt-dlp with multiple client fallbacks.
-    - audio: uses pure audio (140=m4a AAC, 251=webm Opus) or format 18.
-    - video: uses format 18 (progressive MP4 with audio + video combined).
+    Extract a fresh direct stream URL from YouTube using yt-dlp.
+
+    Different player clients expose different formats: the default web
+    clients give the small audio-only m4a (140), while the android clients
+    are best for the progressive video format (18). Each media type
+    therefore uses its own client order and falls back to the rest.
     """
-    cache_key = f"{video_id}_{media_type}"
-    now = time.time()
-    
-    if not force_refresh and cache_key in STREAM_CACHE:
-        url, exp, mime = STREAM_CACHE[cache_key]
-        if now < exp:
-            return url, mime
-
-    client_configs = [
-        {'player_client': ['ios', 'android', 'web']},
-        {'player_client': ['android']},
-        {'player_client': ['ios']},
-        {'player_client': ['web']}
-    ]
-
     if media_type == 'audio':
-        format_spec = '140/251/18/bestaudio[ext=m4a]/bestaudio/best'
+        # Prefer m4a/AAC (works everywhere incl. iOS). Fall back to Opus or
+        # the progressive MP4 (18) which always contains audio.
+        format_spec = '140/251/bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/18/best'
+        # The default web clients expose the small audio-only format 140.
+        # (The android clients only expose muxed format 18 for many videos,
+        # which makes the "audio" player download the whole 12MB video.)
+        client_configs = [
+            {},
+            {'player_client': ['android']},
+            {'player_client': ['android_vr']},
+        ]
     else:
-        format_spec = '18/best'
+        # 18 = 360p progressive MP4 (audio + video in one file).
+        format_spec = '18/22/best[ext=mp4]/best'
+        # The android client is the most reliable source for format 18.
+        client_configs = [
+            {'player_client': ['android']},
+            {'player_client': ['android_vr']},
+            {},
+        ]
 
     last_err = None
     for cfg in client_configs:
@@ -405,8 +463,10 @@ def get_stream_url(video_id, media_type='audio', force_refresh=False):
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
+                'noplaylist': True,
+                'ignoreerrors': False,
+                'socket_timeout': 15,
                 'format': format_spec,
-                'extractor_args': {'youtube': cfg},
                 # Same bot-detection bypass as get_ydl_options — without this,
                 # cloud IPs (Vercel/Render/HF Spaces) get blocked by YouTube.
                 'http_headers': {
@@ -414,70 +474,166 @@ def get_stream_url(video_id, media_type='audio', force_refresh=False):
                     'Referer': 'https://www.youtube.com/'
                 }
             }
+            if cfg:
+                ydl_opts['extractor_args'] = {'youtube': cfg}
             if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
                 ydl_opts['ffmpeg_location'] = FFMPEG_PATH
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                if not info:
+                    raise Exception('YouTube mengembalikan data kosong')
                 stream_url = info.get('url')
                 if stream_url:
-                    ext = info.get('ext', '')
+                    ext = (info.get('ext') or '').lower()
                     if media_type == 'audio':
-                        mime = 'audio/mp4' if ext in ['m4a', 'mp4', 'aac'] else 'audio/webm'
+                        mime = 'audio/mp4' if ext in ('m4a', 'mp4', 'aac') else 'audio/webm'
                     else:
                         mime = 'video/mp4'
-
-                    STREAM_CACHE[cache_key] = (stream_url, now + 10800, mime)
                     return stream_url, mime
+                raise Exception('Format stream tidak ditemukan')
         except Exception as e:
             last_err = e
             continue
 
     raise Exception(f"Gagal mengekstrak stream YouTube: {last_err}")
 
+def get_stream_url(video_id, media_type='audio', force_refresh=False):
+    """
+    Return (url, mime) from cache, extracting only once even when several
+    parallel range requests arrive at the same time.
+    """
+    cache_key = f"{video_id}_{media_type}"
+    now = time.time()
+
+    if not force_refresh and cache_key in STREAM_CACHE:
+        url, exp, mime = STREAM_CACHE[cache_key]
+        if now < exp:
+            return url, mime
+
+    # Coalesce concurrent extractions (browser + prefetch, audio + proxy, ...)
+    with get_stream_lock(cache_key):
+        now = time.time()
+        if not force_refresh and cache_key in STREAM_CACHE:
+            url, exp, mime = STREAM_CACHE[cache_key]
+            if now < exp:
+                return url, mime
+
+        stream_url, mime = extract_stream_url(video_id, media_type)
+        # YouTube URLs are usually valid ~6h; refresh after 3h to be safe.
+        STREAM_CACHE[cache_key] = (stream_url, now + 10800, mime)
+        return stream_url, mime
+
+def get_client_ip():
+    """Best-effort public IP of the browser, including reverse-proxy headers."""
+    for header in ('CF-Connecting-IP', 'True-Client-IP', 'X-Real-IP'):
+        value = request.headers.get(header)
+        if value:
+            return value.split(',')[0].strip()
+    route = getattr(request, 'access_route', None)
+    if route:
+        return route[0]
+    return request.remote_addr or ''
+
+def is_direct_stream_allowed(stream_url):
+    """
+    YouTube adds an `ip=` parameter to stream URLs. The browser may fetch the
+    URL directly only when it comes from the same public IP as the server
+    (local PC + phone on the same WiFi, or Cloudflare tunnel from the same
+    home network). On cloud hosts (Render/Vercel/HF) the browser's IP differs,
+    so the proxy is required.
+    """
+    try:
+        query = parse_qs(urlparse(stream_url).query)
+        stream_ip = (query.get('ip') or [''])[0]
+    except Exception:
+        stream_ip = ''
+
+    if not stream_ip:
+        return True
+
+    client_ip = get_client_ip()
+    if not client_ip:
+        return False
+    if client_ip == stream_ip:
+        return True
+    try:
+        ip = ipaddress.ip_address(client_ip)
+        # LAN/private clients share the server's public NAT IP.
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        return False
+
 @app.route('/api/playback/<video_id>')
 def playback_info(video_id):
+    """
+    Resolve a playable URL. The client uses the direct Google CDN URL when
+    allowed (instant start, no proxy bottleneck) and the proxy otherwise.
+    """
     media_type = request.args.get('type', 'audio').lower()
+    force = request.args.get('refresh') == '1'
     try:
-        stream_url, mime_type = get_stream_url(video_id, media_type)
+        stream_url, mime_type = get_stream_url(video_id, media_type, force_refresh=force)
         return jsonify({
             'success': True,
             'url': stream_url,
             'mime': mime_type,
-            'proxy_url': f'/api/stream/{video_id}?type={media_type}'
+            'proxy_url': f'/api/stream/{video_id}?type={media_type}',
+            'direct_ok': is_direct_stream_allowed(stream_url),
+            'expires_in': 5400  # keep client cache below the server's 3h cache
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+def parse_content_range(value):
+    """Parse 'bytes 0-1023/123456' -> (0, 1023, 123456)."""
+    match = re.match(r'bytes\s+(\d+)-(\d+)/(\d+|\*)', (value or '').strip())
+    if not match:
+        return None
+    total = None if match.group(3) == '*' else int(match.group(3))
+    return int(match.group(1)), int(match.group(2)), total
+
 @app.route('/api/stream/<video_id>')
 def stream_media(video_id):
     """
-    Ultra-reliable stream proxy supporting HTTP 206 Partial Content (Range requests).
-    Chunks data in max 1MB blocks to guarantee 100% compatibility with Vercel,
-    Render, Cloudflare, and mobile browsers without timeouts or payload limits.
+    Stream proxy with HTTP 206 Partial Content support.
+
+    The response body is relayed as it arrives from Google instead of
+    buffering the whole chunk first, so playback starts much sooner and
+    mobile browsers can seek without waiting for a full 1-2MB download.
     """
     media_type = request.args.get('type', 'audio').lower()
+    upstream = None
     try:
         stream_url, mime_type = get_stream_url(video_id, media_type)
         if not stream_url:
             return jsonify({'error': 'Stream URL not found'}), 404
 
         range_header = request.headers.get('Range')
-        
         start_byte = 0
         end_byte = None
-        
+        size_key = f"{video_id}_{media_type}"
+
         if range_header and range_header.startswith('bytes='):
             range_spec = range_header[6:].strip()
-            # Handle suffix range: e.g. bytes=-32768 (requested by mobile browser for metadata)
+            # Suffix range: bytes=-32768 (some mobile browsers request this
+            # to read metadata). Convert it to an absolute range.
             if range_spec.startswith('-'):
                 try:
                     suffix_len = int(range_spec[1:])
-                    total_size = STREAM_CACHE.get(f"{video_id}_{media_type}_size")
+                    total_size = STREAM_SIZE_CACHE.get(size_key)
                     if not total_size:
-                        h = requests.head(stream_url, timeout=5)
-                        total_size = int(h.headers.get('Content-Length', 0))
-                        STREAM_CACHE[f"{video_id}_{media_type}_size"] = total_size
+                        probe = requests.get(
+                            stream_url,
+                            headers={'Range': 'bytes=0-0',
+                                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
+                            timeout=6
+                        )
+                        parsed = parse_content_range(probe.headers.get('Content-Range'))
+                        probe.close()
+                        total_size = parsed[2] if parsed else int(probe.headers.get('Content-Length', 0) or 0)
+                        if total_size:
+                            STREAM_SIZE_CACHE[size_key] = total_size
                     if total_size and total_size > 0:
                         start_byte = max(0, total_size - suffix_len)
                         end_byte = total_size - 1
@@ -496,7 +652,8 @@ def stream_media(video_id):
                     except ValueError:
                         end_byte = None
 
-        # Clamp chunk to MAX_CHUNK (1MB) to ensure sub-second response on Vercel
+        # Clamp each response to MAX_CHUNK so every request stays below
+        # Vercel's 4.5MB payload limit.
         if end_byte is None or (end_byte - start_byte + 1) > MAX_CHUNK:
             requested_end = start_byte + MAX_CHUNK - 1
         else:
@@ -507,33 +664,21 @@ def stream_media(video_id):
             'Range': f'bytes={start_byte}-{requested_end}'
         }
 
-        # Request chunk from GoogleVideo CDN
-        upstream = requests.get(stream_url, headers=forward_headers, timeout=12)
-        
-        # If upstream token expired or returned 403/410, refresh stream URL
+        def open_upstream(url):
+            return requests.get(url, headers=forward_headers, stream=True, timeout=(6, 30))
+
+        upstream = open_upstream(stream_url)
+
+        # If the token expired or Google rejected it, refresh and retry once.
         # NOTE: 416 (Range Not Satisfiable) is a NORMAL EOF case when the
-        # client asks for bytes past the file end — we must NOT treat it as
-        # "expired token" or we waste a re-extraction on every song end.
+        # client asks for bytes past the file end — do not re-extract for it.
         if upstream.status_code in (403, 404, 410):
+            upstream.close()
             STREAM_CACHE.pop(f"{video_id}_{media_type}", None)
             stream_url, mime_type = get_stream_url(video_id, media_type, force_refresh=True)
-            upstream = requests.get(stream_url, headers=forward_headers, timeout=12)
+            upstream = open_upstream(stream_url)
 
         status_code = upstream.status_code
-        # Build a CORRECT Content-Length that matches the exact bytes we return.
-        # Copying Content-Length blindly from upstream is wrong when we clamped
-        # the request to MAX_CHUNK or when the file ended early: the browser
-        # then waits for bytes that never arrive (the classic "stuck spinner"
-        # / "track fails to load" bug on mobile).
-        cr = upstream.headers.get('Content-Range', '').strip()
-        if status_code == 206:
-            # upstream's Content-Range header (e.g. "bytes 1048576-2097151/8405914")
-            # describes exactly the bytes in the body, so keep it verbatim and
-            # only fix Content-Length to the actual payload size.
-            response_bytes = len(upstream.content)
-        else:
-            cr = None
-            response_bytes = len(upstream.content)
 
         response_headers = {
             'Content-Type': upstream.headers.get('Content-Type', mime_type),
@@ -541,22 +686,58 @@ def stream_media(video_id):
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Headers': 'Range, Content-Type, Accept',
             'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges',
-            'Cache-Control': 'public, max-age=3600'
+            'Cache-Control': 'public, max-age=3600',
+            'X-Accel-Buffering': 'no'
         }
 
-        if cr:
-            response_headers['Content-Range'] = cr
-        elif status_code == 416:
-            # RFC 7233: a 416 should carry "Content-Range: bytes */TOTAL" so
-            # the player learns the real file size instead of dead-ending.
+        if status_code == 416:
             length_marker = upstream.headers.get('Content-Range', '').strip()
             if length_marker.startswith('bytes */'):
                 response_headers['Content-Range'] = length_marker
-        response_headers['Content-Length'] = str(response_bytes)
+            upstream.close()
+            response_headers['Content-Length'] = '0'
+            return Response(b'', status=416, headers=response_headers)
 
-        return Response(upstream.content, status=status_code, headers=response_headers)
+        if status_code not in (200, 206):
+            upstream.close()
+            return jsonify({'error': f'YouTube CDN error {status_code}'}), 502
+
+        cr = upstream.headers.get('Content-Range', '').strip()
+        if status_code == 206 and cr:
+            response_headers['Content-Range'] = cr
+            parsed = parse_content_range(cr)
+            if parsed:
+                expected_bytes = parsed[1] - parsed[0] + 1
+                if parsed[2]:
+                    STREAM_SIZE_CACHE[size_key] = parsed[2]
+            else:
+                expected_bytes = None
+        else:
+            length = upstream.headers.get('Content-Length')
+            expected_bytes = int(length) if length and length.isdigit() else None
+
+        if expected_bytes is not None:
+            response_headers['Content-Length'] = str(expected_bytes)
+
+        def relay():
+            """Yield CDN bytes immediately; close the upstream on disconnect."""
+            try:
+                for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        yield chunk
+            except Exception as exc:
+                print("Stream relay error:", exc)
+            finally:
+                upstream.close()
+
+        return Response(relay(), status=status_code, headers=response_headers)
 
     except Exception as e:
+        if upstream is not None:
+            try:
+                upstream.close()
+            except Exception:
+                pass
         print("Stream error:", e)
         return jsonify({'error': str(e)}), 500
 

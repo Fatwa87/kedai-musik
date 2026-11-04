@@ -31,7 +31,10 @@ document.addEventListener('DOMContentLoaded', () => {
     ytPlayer: null,
     ytPlayerReady: false,
     ytSyncInterval: null,
-    deferredPrompt: null
+    deferredPrompt: null,
+    playToken: 0,
+    playbackCache: new Map(),
+    lastPrefetchedId: null
   };
 
   // ------------------------------------------------------------------------
@@ -132,6 +135,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnOpenQrModal = document.getElementById('btnOpenQrModal');
   const btnCopyUrl = document.getElementById('btnCopyUrl');
   const mobileUrlText = document.getElementById('mobileUrlText');
+  const qrStatusText = document.getElementById('qrStatusText');
   const modalSleepTimer = document.getElementById('modalSleepTimer');
   const btnCloseSleepModal = document.getElementById('btnCloseSleepModal');
   const btnOpenSleepTimerModal = document.getElementById('btnOpenSleepTimerModal');
@@ -177,11 +181,14 @@ document.addEventListener('DOMContentLoaded', () => {
   // the element silently restarts from 0 (and play() can reject). This
   // waits for 'loadedmetadata' before seeking.
   function assignSrcAndSeek(media, url, resumeTime, resumePlay) {
-    media.src = url;
-    media.playbackRate = state.playbackSpeed;
+    const token = (media._srcToken || 0) + 1;
+    media._srcToken = token;
 
     const doSeek = () => {
-      try { media.currentTime = resumeTime || 0; } catch (e) {}
+      if (token !== media._srcToken) return;
+      try {
+        if (resumeTime && resumeTime > 0.5) media.currentTime = resumeTime;
+      } catch (e) {}
       if (resumePlay) {
         media.play()
           .then(() => {
@@ -196,14 +203,110 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     };
 
-    if (media.readyState >= 1) {
-      // Metadata already available (e.g. mode switch while playing)
+    media.addEventListener('loadedmetadata', doSeek, { once: true });
+    media.src = url;
+    media.playbackRate = state.playbackSpeed;
+
+    // Same source is already buffered (mode switch / resume).
+    if (media.readyState >= 1 && media.currentSrc === url) {
       doSeek();
-    } else {
-      media.addEventListener('loadedmetadata', doSeek, { once: true });
-      // Also kick off the buffer so the spinner disappears as soon as possible
-      media.load();
+      return;
     }
+
+    // Kick off the buffer so metadata (and therefore playback) arrives ASAP.
+    try { media.load(); } catch (e) {}
+  }
+
+  // ------------------------------------------------------------------------
+  // Fast playback URL resolver + prefetch
+  // ------------------------------------------------------------------------
+  const playbackRequests = new Map();
+  const PLAYBACK_CACHE_TTL = 90 * 60 * 1000; // 90 minutes
+
+  function getPlayback(track, type, forceRefresh = false) {
+    const key = `${track.id}_${type}`;
+    const cached = state.playbackCache.get(key);
+
+    if (!forceRefresh && cached && cached.expires > Date.now() + 5000) {
+      return Promise.resolve(cached);
+    }
+
+    if (!forceRefresh && playbackRequests.has(key)) {
+      return playbackRequests.get(key);
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 25000);
+    const requestUrl = `/api/playback/${encodeURIComponent(track.id)}?type=${encodeURIComponent(type)}${forceRefresh ? '&refresh=1' : ''}`;
+
+    const request = fetch(requestUrl, { signal: controller.signal })
+      .then(res => {
+        if (!res.ok) throw new Error(`Playback HTTP ${res.status}`);
+        return res.json();
+      })
+      .then(data => {
+        if (!data || !data.success || !data.url) {
+          throw new Error((data && data.error) || 'URL stream tidak tersedia');
+        }
+        data.expires = Date.now() + Math.min(
+          (data.expires_in || 3600) * 1000,
+          PLAYBACK_CACHE_TTL
+        );
+        state.playbackCache.set(key, data);
+        return data;
+      })
+      .finally(() => {
+        clearTimeout(timeoutId);
+        if (playbackRequests.get(key) === request) playbackRequests.delete(key);
+      });
+
+    playbackRequests.set(key, request);
+    return request;
+  }
+
+  function getPlayableUrl(data) {
+    // Direct Google CDN = fast start. Proxy only when the CDN URL is tied to
+    // the server's public IP (Render/Vercel/HF) or direct playback failed.
+    return data.direct_ok === false ? data.proxy_url : data.url;
+  }
+
+  function prefetchPlayback(track, type, delayMs = 600) {
+    if (!track || !track.id || state.isUsingYtFallback) return;
+    setTimeout(() => {
+      getPlayback(track, type).catch(() => {});
+    }, delayMs);
+  }
+
+  function prefetchNextTrack(track) {
+    if (state.isUsingYtFallback || !track || state.queue.length === 0) return;
+    const idx = state.queue.findIndex(t => t.id === track.id);
+    const next = idx >= 0 ? state.queue[idx + 1] : null;
+    if (!next || next.id === track.id || state.lastPrefetchedId === next.id) return;
+    state.lastPrefetchedId = next.id;
+    prefetchPlayback(next, state.mode);
+  }
+
+  function loadTrackIntoMedia(media, track, type, resumeTime, resumePlay) {
+    const token = ++state.playToken;
+    playerSpinner.classList.remove('hidden');
+    fullPlayIcon.classList.add('hidden');
+
+    getPlayback(track, type)
+      .then(data => {
+        if (token !== state.playToken) return;
+        media._usingDirect = data.direct_ok !== false;
+        media._proxyUrl = data.proxy_url;
+        assignSrcAndSeek(media, getPlayableUrl(data), resumeTime, resumePlay);
+      })
+      .catch(err => {
+        if (token !== state.playToken) return;
+        console.warn('Playback resolve error:', err);
+        // Last resort: use the same-origin proxy. If that also fails the
+        // media error handler will activate the YouTube iframe fallback.
+        media._usingDirect = false;
+        media._proxyUrl = `/api/stream/${track.id}?type=${type}`;
+        assignSrcAndSeek(media, media._proxyUrl, resumeTime, resumePlay);
+      });
   }
 
   function playTrack(track, autoStart = true) {
@@ -211,6 +314,7 @@ document.addEventListener('DOMContentLoaded', () => {
     
     audioEl._retries = 0;
     videoEl._retries = 0;
+    state.lastPrefetchedId = null;
     
     state.currentTrack = track;
     addToHistory(track);
@@ -231,12 +335,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (state.mode === 'video') {
       stopMediaElement(audioEl);
-      const videoStreamUrl = `/api/stream/${track.id}?type=video`;
-      assignSrcAndSeek(videoEl, videoStreamUrl, 0, autoStart);
+      loadTrackIntoMedia(videoEl, track, 'video', 0, autoStart);
     } else {
       stopMediaElement(videoEl);
-      const audioStreamUrl = `/api/stream/${track.id}?type=audio`;
-      assignSrcAndSeek(audioEl, audioStreamUrl, 0, autoStart);
+      loadTrackIntoMedia(audioEl, track, 'audio', 0, autoStart);
     }
 
     setupMediaSession(track);
@@ -404,22 +506,28 @@ document.addEventListener('DOMContentLoaded', () => {
       btnModeVideo.classList.remove('active');
       audioDisplay.classList.remove('hidden');
       videoDisplay.classList.add('hidden');
-
       stopMediaElement(videoEl);
 
       if (state.currentTrack) {
-        assignSrcAndSeek(audioEl, `/api/stream/${state.currentTrack.id}?type=audio`, currentTime, wasPlaying);
+        if (state.isUsingYtFallback) {
+          fallbackToYouTubePlayer(state.currentTrack);
+        } else {
+          loadTrackIntoMedia(audioEl, state.currentTrack, 'audio', currentTime, wasPlaying);
+        }
       }
     } else {
       btnModeVideo.classList.add('active');
       btnModeAudio.classList.remove('active');
       videoDisplay.classList.remove('hidden');
       audioDisplay.classList.add('hidden');
-
       stopMediaElement(audioEl);
 
       if (state.currentTrack) {
-        assignSrcAndSeek(videoEl, `/api/stream/${state.currentTrack.id}?type=video`, currentTime, wasPlaying);
+        if (state.isUsingYtFallback) {
+          fallbackToYouTubePlayer(state.currentTrack);
+        } else {
+          loadTrackIntoMedia(videoEl, state.currentTrack, 'video', currentTime, wasPlaying);
+        }
       }
     }
   }
@@ -521,7 +629,11 @@ document.addEventListener('DOMContentLoaded', () => {
         switchedToAudioForBackground = true;
 
         stopMediaElement(videoEl);
-        assignSrcAndSeek(audioEl, `/api/stream/${state.currentTrack.id}?type=audio`, currentPos, true);
+        if (state.isUsingYtFallback) {
+          fallbackToYouTubePlayer(state.currentTrack);
+        } else {
+          loadTrackIntoMedia(audioEl, state.currentTrack, 'audio', currentPos, true);
+        }
       }
     } else {
       // Ponsel dibuka kembali / layar menyala
@@ -531,7 +643,11 @@ document.addEventListener('DOMContentLoaded', () => {
         const wasPlaying = !audioEl.paused;
 
         stopMediaElement(audioEl);
-        assignSrcAndSeek(videoEl, `/api/stream/${state.currentTrack.id}?type=video`, currentPos, wasPlaying);
+        if (state.isUsingYtFallback) {
+          fallbackToYouTubePlayer(state.currentTrack);
+        } else {
+          loadTrackIntoMedia(videoEl, state.currentTrack, 'video', currentPos, wasPlaying);
+        }
       }
     }
   });
@@ -580,7 +696,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     media.addEventListener('playing', () => {
       state.isPlaying = true;
+      media._retries = 0;
       updatePlaybackUI(true);
+
+      const isActive = (state.mode === 'video' && media === videoEl) || (state.mode === 'audio' && media === audioEl);
+      if (isActive) prefetchNextTrack(state.currentTrack);
     });
 
     media.addEventListener('pause', () => {
@@ -613,28 +733,40 @@ document.addEventListener('DOMContentLoaded', () => {
       // 4. If media is already actively playing, DO NOT show error!
       if (!media.paused && media.currentTime > 0) return;
 
-      // 5. Automatic self-healing retry (up to 3x) before showing error toast.
-      //    1st-2nd: refresh the proxy stream with a fresh token.
-      //    3rd: fall back to the direct Google CDN URL (bypasses proxy limits).
-      if (media._retries < 3 && state.currentTrack) {
-        media._retries = (media._retries || 0) + 1;
-        console.warn('Playback error detected, retry', media._retries, 'with fresh token...');
+      if (state.isUsingYtFallback || !state.currentTrack) return;
 
-        if (media._retries < 3) {
-          fetch(`/api/playback/${state.currentTrack.id}?type=${state.mode}`)
-            .then(res => res.json())
-            .then(data => {
-              if (data.success && data.proxy_url) {
-                media.src = `${data.proxy_url}&_r=${Date.now()}`;
-                media.play().catch(() => {});
-              } else {
-                tryDirectFallback(media);
-              }
-            })
-            .catch(() => tryDirectFallback(media));
-        } else {
-          tryDirectFallback(media);
+      // 5. Fast self-healing:
+      //    Direct Google CDN failed
+      //      -> instantly switch to the same-origin proxy.
+      //    Proxy failed
+      //      -> refresh the URL and try direct; if direct is not allowed
+      //         (cloud IP mismatch), use the YouTube player fallback.
+      if ((media._retries || 0) < 3) {
+        media._retries = (media._retries || 0) + 1;
+        console.warn('Playback error detected, retry', media._retries, '...');
+
+        if (media._usingDirect) {
+          media._usingDirect = false;
+          const proxyUrl = media._proxyUrl || `/api/stream/${state.currentTrack.id}?type=${state.mode}`;
+          const joiner = proxyUrl.includes('?') ? '&' : '?';
+          assignSrcAndSeek(media, `${proxyUrl}${joiner}_r=${Date.now()}`, media.currentTime || 0, true);
+          return;
         }
+
+        getPlayback(state.currentTrack, state.mode, true)
+          .then(data => {
+            if (!state.currentTrack) return;
+            if (data.direct_ok === false) {
+              // Proxy-based playback already failed on this device; the
+              // iframe player is the only remaining option.
+              fallbackToYouTubePlayer(state.currentTrack);
+              return;
+            }
+            media._usingDirect = true;
+            media._proxyUrl = data.proxy_url;
+            assignSrcAndSeek(media, data.url, media.currentTime || 0, true);
+          })
+          .catch(() => fallbackToYouTubePlayer(state.currentTrack));
         return;
       }
 
@@ -643,22 +775,6 @@ document.addEventListener('DOMContentLoaded', () => {
       fullPlayIcon.classList.remove('hidden');
       showToast('⚠️ Gagal memuat track, coba pilih lagu lain.');
     });
-
-    function tryDirectFallback(media) {
-      fetch(`/api/playback/${state.currentTrack.id}?type=${state.mode}`)
-        .then(res => res.json())
-        .then(data => {
-          if (data.success && data.url) {
-            media.src = data.url;
-            media.play().catch(() => fallbackToYouTubePlayer(state.currentTrack));
-          } else {
-            fallbackToYouTubePlayer(state.currentTrack);
-          }
-        })
-        .catch(() => {
-          fallbackToYouTubePlayer(state.currentTrack);
-        });
-    }
   });
 
   // ------------------------------------------------------------------------
@@ -893,6 +1009,9 @@ document.addEventListener('DOMContentLoaded', () => {
           state.queue = [...tracks];
           playTrack(track);
         });
+
+        // Warm the first track so the very first tap starts almost instantly.
+        prefetchPlayback(tracks[0], state.mode, 0);
       })
       .catch(err => {
         console.error('Trending fetch error:', err);
@@ -953,6 +1072,9 @@ document.addEventListener('DOMContentLoaded', () => {
           state.queue = [...results];
           playTrack(track);
         });
+
+        // Warm the first result while the user is still looking at the list.
+        prefetchPlayback(results[0], state.mode, 0);
 
         // Tombol Muat Lebih Banyak Lagu (seberapa adanya hasil di YouTube)
         if (results.length >= 20 && results.length < 100) {
@@ -1249,6 +1371,11 @@ document.addEventListener('DOMContentLoaded', () => {
   // Mini-player click -> Open fullscreen player
   miniPlayerClickable.addEventListener('click', () => {
     fullPlayerModal.classList.add('open');
+    // Warm the other mode (video) while the player sheet is opening, so
+    // tapping "Video" does not have to wait for yt-dlp extraction.
+    if (state.currentTrack && !state.isUsingYtFallback) {
+      prefetchPlayback(state.currentTrack, state.mode === 'video' ? 'audio' : 'video', 0);
+    }
   });
 
   // Close fullscreen player
@@ -1446,9 +1573,11 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  // Refresh QR code if Cloudflare Tunnel became ready
+  // Refresh the QR code / mobile URL. On a local PC the Cloudflare tunnel
+  // often needs more than 7 seconds to come online, so keep polling until
+  // the public URL is available (max ~40 seconds).
   function refreshNetworkInfo() {
-    fetch('/api/network-info')
+    return fetch('/api/network-info', { cache: 'no-store' })
       .then(res => res.json())
       .then(data => {
         if (data && data.url) {
@@ -1459,14 +1588,27 @@ document.addEventListener('DOMContentLoaded', () => {
           if (mobileUrlText) {
             mobileUrlText.textContent = data.url;
           }
+          if (qrStatusText) {
+            qrStatusText.textContent = data.public_url
+              ? 'Tautan aman siap dipakai dari WiFi mana pun (termasuk WiFi kantor / hotspot) maupun paket data seluler.'
+              : 'Menggunakan alamat WiFi lokal. Pastikan HP dan komputer terhubung ke jaringan yang sama, atau tunggu tautan Cloudflare selesai disiapkan.';
+          }
         }
+        return data;
       })
-      .catch(() => {});
+      .catch(() => null);
   }
-  
-  // Check after 3s and 6s for tunnel ready
-  setTimeout(refreshNetworkInfo, 3000);
-  setTimeout(refreshNetworkInfo, 7000);
+
+  function pollNetworkInfo(attempt = 0) {
+    refreshNetworkInfo().then(data => {
+      // Stop as soon as a public (tunnel/cloud) URL is available.
+      if (data && data.public_url) return;
+      if (attempt >= 20) return;
+      setTimeout(() => pollNetworkInfo(attempt + 1), 2000);
+    });
+  }
+
+  pollNetworkInfo();
 
   // Close modals on clicking overlay backdrop
   [modalQr, modalSleepTimer].forEach(m => {

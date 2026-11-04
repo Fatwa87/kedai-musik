@@ -1484,12 +1484,15 @@ body {
 }
 
 .qr-image-wrapper {
-  background: #090a10;
+  /* White frame keeps the mandatory quiet zone of the QR code intact so
+     phone cameras can lock onto it instantly. */
+  background: #ffffff;
   padding: 12px;
   border-radius: var(--radius-md);
   display: inline-block;
   margin-bottom: 14px;
   border: 1px solid var(--border-color);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
 }
 
 .qr-image-wrapper img {
@@ -1513,9 +1516,11 @@ body {
   font-size: 0.8rem;
   color: #c4b5fd;
   text-align: left;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Show the full link instead of an ellipsis, so it can still be typed
+     manually if a phone camera refuses to scan the QR code. */
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  line-height: 1.35;
 }
 
 .btn-copy {
