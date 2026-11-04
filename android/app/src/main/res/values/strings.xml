@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Kedai Musik</string>
+    <!-- GANTI URL INI dengan alamat live aplikasi kamu (Vercel/Render). -->
+    <string name="app_url">https://my-kedai-musik.vercel.app</string>
+</resources>

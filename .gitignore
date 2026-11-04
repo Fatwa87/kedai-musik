@@ -13,6 +13,13 @@ ENV/
 cloudflared.exe
 *.log
 
+# Android / Gradle build output
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+*.apk
+
 # IDE & OS
 .vscode/
 .idea/

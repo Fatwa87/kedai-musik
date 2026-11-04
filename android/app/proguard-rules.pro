@@ -1,0 +1,1 @@
+# No minification configured for this WebView wrapper.
