@@ -1768,7 +1768,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  window.onYouTubeIframeAPIReady = function() {
+  function initYouTubePlayer() {
+    if (state.ytPlayer) return;
+    if (!(window.YT && typeof YT.Player === 'function')) return;
     try {
       state.ytPlayer = new YT.Player('ytAudioPlayer', {
         height: '100%',
@@ -1816,9 +1818,16 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       });
     } catch (e) {
+      state.ytPlayer = null;
       console.warn('YT Iframe API init error:', e);
     }
-  };
+  }
+
+  window.onYouTubeIframeAPIReady = initYouTubePlayer;
+  // The iframe API can finish loading before this script registers the
+  // callback (common when www-widgetapi.js is cached), which used to leave
+  // the player uninitialized. Initialize eagerly when the API is ready too.
+  initYouTubePlayer();
 
   // ------------------------------------------------------------------------
   // Initial Boot
