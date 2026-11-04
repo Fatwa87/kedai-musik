@@ -19,7 +19,7 @@ try:
 except Exception:
     pass
 
-from urllib.parse import quote, parse_qs, urlparse
+from urllib.parse import quote, urlparse
 from flask import Flask, request, jsonify, render_template, Response, send_file, send_from_directory, redirect
 import requests
 import yt_dlp
@@ -524,64 +524,65 @@ def get_stream_url(video_id, media_type='audio', force_refresh=False):
         STREAM_CACHE[cache_key] = (stream_url, now + 10800, mime)
         return stream_url, mime
 
-def get_client_ip():
-    """Best-effort public IP of the browser, including reverse-proxy headers."""
-    for header in ('CF-Connecting-IP', 'True-Client-IP', 'X-Real-IP'):
-        value = request.headers.get(header)
-        if value:
-            return value.split(',')[0].strip()
-    route = getattr(request, 'access_route', None)
-    if route:
-        return route[0]
-    return request.remote_addr or ''
+def encode_stream_ref(url):
+    """Encode a stream URL so the proxy can reuse it without re-running yt-dlp."""
+    return base64.urlsafe_b64encode(url.encode('utf-8')).decode('ascii').rstrip('=')
 
-def is_direct_stream_allowed(stream_url):
-    """
-    YouTube adds an `ip=` parameter to stream URLs. The browser may fetch the
-    URL directly only when it comes from the same public IP as the server
-    (local PC + phone on the same WiFi, or Cloudflare tunnel from the same
-    home network). On cloud hosts (Render/Vercel/HF) the browser's IP differs,
-    so the proxy is required.
-    """
+def decode_stream_ref(value):
+    """Decode + validate a stream URL supplied by the client."""
+    if not value or len(value) > 8192:
+        return None
     try:
-        query = parse_qs(urlparse(stream_url).query)
-        stream_ip = (query.get('ip') or [''])[0]
+        padded = value + '=' * (-len(value) % 4)
+        url = base64.urlsafe_b64decode(padded.encode('ascii')).decode('utf-8')
+        parsed = urlparse(url)
     except Exception:
-        stream_ip = ''
-
-    if not stream_ip:
-        return True
-
-    client_ip = get_client_ip()
-    if not client_ip:
-        return False
-    if client_ip == stream_ip:
-        return True
-    try:
-        ip = ipaddress.ip_address(client_ip)
-        # LAN/private clients share the server's public NAT IP.
-        return ip.is_private or ip.is_loopback or ip.is_link_local
-    except ValueError:
-        return False
+        return None
+    host = (parsed.hostname or '').lower()
+    if parsed.scheme not in ('http', 'https'):
+        return None
+    # Only allow Google's media CDN, never an arbitrary URL (open proxy).
+    if host != 'googlevideo.com' and not host.endswith('.googlevideo.com'):
+        return None
+    return url
 
 @app.route('/api/playback/<video_id>')
 def playback_info(video_id):
     """
-    Resolve a playable URL. The client uses the direct Google CDN URL when
-    allowed (instant start, no proxy bottleneck) and the proxy otherwise.
+    Resolve a playable URL.
+
+    Direct-first is intentional: Google's CDN URLs include the server's IP,
+    but in practice they are NOT enforced against the browser's IP (verified
+    against a Vercel-generated URL from a different network). Playing the
+    CDN directly removes Vercel's serverless proxy from the hot path, which
+    is the difference between several seconds of buffering and instant start.
+    The client falls back to /api/stream automatically if direct fails.
     """
     media_type = request.args.get('type', 'audio').lower()
     force = request.args.get('refresh') == '1'
     try:
         stream_url, mime_type = get_stream_url(video_id, media_type, force_refresh=force)
-        return jsonify({
+        proxy_url = (
+            f'/api/stream/{video_id}?type={media_type}'
+            f'&u={encode_stream_ref(stream_url)}'
+        )
+        response = jsonify({
             'success': True,
             'url': stream_url,
             'mime': mime_type,
-            'proxy_url': f'/api/stream/{video_id}?type={media_type}',
-            'direct_ok': is_direct_stream_allowed(stream_url),
+            'proxy_url': proxy_url,
+            'direct_ok': True,
             'expires_in': 5400  # keep client cache below the server's 3h cache
         })
+        if not force:
+            # Cache the resolved URL at the edge for 30 minutes. Prefetch and
+            # the user's tap then share one response instead of two cold
+            # serverless invocations running yt-dlp.
+            response.headers['Cache-Control'] = 'public, max-age=1800, s-maxage=1800, stale-while-revalidate=600'
+            response.headers['Vercel-CDN-Cache-Control'] = 'public, max-age=1800, stale-while-revalidate=600'
+        else:
+            response.headers['Cache-Control'] = 'no-store'
+        return response
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -605,7 +606,15 @@ def stream_media(video_id):
     media_type = request.args.get('type', 'audio').lower()
     upstream = None
     try:
-        stream_url, mime_type = get_stream_url(video_id, media_type)
+        # The playback response embeds the resolved CDN URL in `u`, so each
+        # range request can relay immediately. Without this, every 2MB chunk
+        # on Vercel would cold-start a new function and re-run yt-dlp (2-5s).
+        provided_url = decode_stream_ref(request.args.get('u'))
+        if provided_url:
+            stream_url = provided_url
+            mime_type = 'audio/mp4' if media_type == 'audio' else 'video/mp4'
+        else:
+            stream_url, mime_type = get_stream_url(video_id, media_type)
         if not stream_url:
             return jsonify({'error': 'Stream URL not found'}), 404
 

@@ -169,6 +169,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function stopMediaElement(media) {
     if (!media) return;
     try {
+      clearTimeout(media._watchdogTimer);
       media.pause();
       media.removeAttribute('src');
       media.load();
@@ -265,9 +266,24 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function getPlayableUrl(data) {
-    // Direct Google CDN = fast start. Proxy only when the CDN URL is tied to
-    // the server's public IP (Render/Vercel/HF) or direct playback failed.
-    return data.direct_ok === false ? data.proxy_url : data.url;
+    // Always try the direct Google CDN first: it starts instantly and avoids
+    // the Vercel serverless proxy entirely. The media error handler and the
+    // watchdog below switch to the proxy if direct playback fails or stalls.
+    return data.url;
+  }
+
+  function armDirectWatchdog(media, resumeTime, resumePlay) {
+    const token = media._srcToken;
+    clearTimeout(media._watchdogTimer);
+    media._watchdogTimer = setTimeout(() => {
+      if (token !== media._srcToken || !media._usingDirect) return;
+      if (media.readyState >= 2 || media.currentTime > 0.2) return;
+
+      console.warn('Direct CDN stalled, switching to proxy...');
+      media._usingDirect = false;
+      if (!media._proxyUrl) return;
+      assignSrcAndSeek(media, media._proxyUrl, resumeTime || 0, resumePlay);
+    }, 4500);
   }
 
   function prefetchPlayback(track, type, delayMs = 600) {
@@ -294,9 +310,10 @@ document.addEventListener('DOMContentLoaded', () => {
     getPlayback(track, type)
       .then(data => {
         if (token !== state.playToken) return;
-        media._usingDirect = data.direct_ok !== false;
+        media._usingDirect = true;
         media._proxyUrl = data.proxy_url;
         assignSrcAndSeek(media, getPlayableUrl(data), resumeTime, resumePlay);
+        armDirectWatchdog(media, resumeTime, resumePlay);
       })
       .catch(err => {
         if (token !== state.playToken) return;
