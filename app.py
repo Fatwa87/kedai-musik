@@ -425,7 +425,7 @@ def video_info(video_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-def extract_stream_url(video_id, media_type='audio'):
+def extract_stream_url(video_id, media_type='audio', client_configs=None):
     """
     Extract a fresh direct stream URL from YouTube using yt-dlp.
 
@@ -433,6 +433,9 @@ def extract_stream_url(video_id, media_type='audio'):
     clients give the small audio-only m4a (140), while the android clients
     are best for the progressive video format (18). Each media type
     therefore uses its own client order and falls back to the rest.
+
+    `client_configs` may be supplied to force specific player clients
+    (used by the diagnostics endpoint and cloud fallbacks).
     """
     if media_type == 'audio':
         # Prefer m4a/AAC (works everywhere incl. iOS). Fall back to Opus or
@@ -441,20 +444,22 @@ def extract_stream_url(video_id, media_type='audio'):
         # The default web clients expose the small audio-only format 140.
         # (The android clients only expose muxed format 18 for many videos,
         # which makes the "audio" player download the whole 12MB video.)
-        client_configs = [
-            {},
-            {'player_client': ['android']},
-            {'player_client': ['android_vr']},
-        ]
+        if client_configs is None:
+            client_configs = [
+                {},
+                {'player_client': ['android']},
+                {'player_client': ['android_vr']},
+            ]
     else:
         # 18 = 360p progressive MP4 (audio + video in one file).
         format_spec = '18/22/best[ext=mp4]/best'
         # The android client is the most reliable source for format 18.
-        client_configs = [
-            {'player_client': ['android']},
-            {'player_client': ['android_vr']},
-            {},
-        ]
+        if client_configs is None:
+            client_configs = [
+                {'player_client': ['android']},
+                {'player_client': ['android_vr']},
+                {},
+            ]
 
     last_err = None
     for cfg in client_configs:
@@ -561,7 +566,18 @@ def playback_info(video_id):
     media_type = request.args.get('type', 'audio').lower()
     force = request.args.get('refresh') == '1'
     try:
-        stream_url, mime_type = get_stream_url(video_id, media_type, force_refresh=force)
+        # Diagnostics: ?client=tv,web_safari forces specific player clients
+        # and bypasses the cache. Used to find clients that survive YouTube's
+        # datacenter-IP bot check when deployed on Vercel.
+        client_param = request.args.get('client')
+        if client_param:
+            clients = [c.strip() for c in client_param.split(',') if c.strip()]
+            stream_url, mime_type = extract_stream_url(
+                video_id, media_type,
+                client_configs=[{'player_client': clients}]
+            )
+        else:
+            stream_url, mime_type = get_stream_url(video_id, media_type, force_refresh=force)
         proxy_url = (
             f'/api/stream/{video_id}?type={media_type}'
             f'&u={encode_stream_ref(stream_url)}'
@@ -574,7 +590,7 @@ def playback_info(video_id):
             'direct_ok': True,
             'expires_in': 5400  # keep client cache below the server's 3h cache
         })
-        if not force:
+        if not force and not client_param:
             # Cache the resolved URL at the edge for 30 minutes. Prefetch and
             # the user's tap then share one response instead of two cold
             # serverless invocations running yt-dlp.
