@@ -3,9 +3,17 @@ services:
     name: kedai-musik
     runtime: python
     plan: free
+    region: singapore
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn -w 1 --threads 8 --timeout 120 -b 0.0.0.0:$PORT app:app
+    healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # Opsional: tempel cookies YouTube (Netscape format, atau base64)
+      # untuk menghindari blokir "Sign in to confirm you're not a bot"
+      # dari IP datacenter Render. Kosongkan jika belum punya.
+      - key: YOUTUBE_COOKIES
+        value: ""
