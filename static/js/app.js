@@ -266,21 +266,49 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function getPlayableUrl(data) {
-    // Always try the direct Google CDN first: it starts instantly and avoids
-    // the Vercel serverless proxy entirely. The media error handler and the
-    // watchdog below switch to the proxy if direct playback fails or stalls.
+    // When deployed behind a cloud proxy (Vercel/Render/HF), the direct
+    // Google CDN URL is signed against the SERVER's datacenter IP and is
+    // frequently throttled or rejected from the user's phone. Starting on it
+    // means every track wastes ~4.5s on the direct watchdog before switching
+    // to the proxy. So on cloud the same-origin proxy (which relays bytes
+    // with proper Range support and is served from the user's own request
+    // path) is the faster, more reliable starting point; the direct CDN is
+    // still kept as the fast local-only path where it is genuinely instant.
+    if (data.proxy_url) {
+      // Prefer proxy on cloud. Locally (dev on the same PC) direct is faster.
+      // The client can't see the server env, so detect cloud by host: real
+      // domains (Vercel/HF) vs localhost/LAN IP.
+      const host = (window.location.hostname || '').toLowerCase();
+      const isCloud = !(host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.') || host.startsWith('10.') || host.endsWith('.local'));
+      if (isCloud) {
+        return data.proxy_url;
+      }
+    }
     return data.url;
   }
 
-  function armStartWatchdog(media, resumeTime, resumePlay, stage = 'direct') {
+  function armStartWatchdog(media, resumeTime, resumePlay, stage = 'proxy') {
     const token = media._srcToken;
     clearTimeout(media._watchdogTimer);
-    const timeout = stage === 'direct' ? 4500 : 7000;
+    // Shorter timeouts so a stalled source switches to the next one quickly
+    // instead of sitting on a spinner. Proxy (same-origin) is tried first on
+    // cloud, direct CDN second, YouTube iframe last.
+    const timeout = stage === 'proxy' ? 3500 : (stage === 'direct' ? 4000 : 6000);
 
     media._watchdogTimer = setTimeout(() => {
       if (token !== media._srcToken) return;
       if (media.readyState >= 2 || media.currentTime > 0.2) return;
 
+      // Proxy stalled -> try the direct CDN (fast when it works).
+      if (stage === 'proxy' && media._usingProxy && media._directUrl) {
+        console.warn('Proxy stalled, switching to direct CDN...');
+        media._usingProxy = false;
+        assignSrcAndSeek(media, media._directUrl, resumeTime || 0, resumePlay);
+        armStartWatchdog(media, resumeTime, resumePlay, 'direct');
+        return;
+      }
+
+      // Direct CDN stalled -> try the proxy.
       if (stage === 'direct' && media._usingDirect && media._proxyUrl) {
         console.warn('Direct CDN stalled, switching to proxy...');
         media._usingDirect = false;
@@ -289,11 +317,11 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      // Proxy also failed to produce audio/video in time. YouTube's iframe
+      // Everything failed to produce audio/video in time. YouTube's iframe
       // player is the last reliable option and starts much faster than
       // hanging on a spinner forever.
       if (state.currentTrack) {
-        console.warn('Proxy stalled, switching to YouTube player fallback...');
+        console.warn('All sources stalled, switching to YouTube player fallback...');
         fallbackToYouTubePlayer(state.currentTrack);
       }
     }, timeout);
@@ -323,10 +351,15 @@ document.addEventListener('DOMContentLoaded', () => {
     getPlayback(track, type)
       .then(data => {
         if (token !== state.playToken) return;
-        media._usingDirect = true;
+        media._directUrl = data.url;
         media._proxyUrl = data.proxy_url;
-        assignSrcAndSeek(media, getPlayableUrl(data), resumeTime, resumePlay);
-        armStartWatchdog(media, resumeTime, resumePlay, 'direct');
+        // Start on whichever source getPlayableUrl decides (proxy on cloud,
+        // direct CDN locally). The watchdog flips to the other on stall.
+        const startUrl = getPlayableUrl(data);
+        media._usingProxy = startUrl === data.proxy_url;
+        media._usingDirect = !media._usingProxy;
+        assignSrcAndSeek(media, startUrl, resumeTime, resumePlay);
+        armStartWatchdog(media, resumeTime, resumePlay, media._usingProxy ? 'proxy' : 'direct');
       })
       .catch(err => {
         if (token !== state.playToken) return;
@@ -766,17 +799,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
       if (state.isUsingYtFallback || !state.currentTrack) return;
 
-      // 5. Fast self-healing:
-      //    Direct Google CDN failed
-      //      -> instantly switch to the same-origin proxy.
-      //    Proxy failed
-      //      -> refresh the URL once, then use YouTube's iframe player.
+      // 5. Fast self-healing, mirroring the watchdog's source order:
+      //    Proxy (cloud-first) -> direct CDN -> refresh URL -> YouTube iframe.
       if ((media._retries || 0) < 3) {
         media._retries = (media._retries || 0) + 1;
         console.warn('Playback error detected, retry', media._retries, '...');
 
-        if (media._usingDirect) {
+        if (media._usingProxy && media._directUrl) {
+          media._usingProxy = false;
+          media._usingDirect = true;
+          assignSrcAndSeek(media, media._directUrl, media.currentTime || 0, true);
+          armStartWatchdog(media, media.currentTime || 0, true, 'direct');
+          return;
+        }
+
+        if (media._usingDirect && media._proxyUrl) {
           media._usingDirect = false;
+          media._usingProxy = true;
           const proxyUrl = media._proxyUrl || `/api/stream/${state.currentTrack.id}?type=${state.mode}`;
           const joiner = proxyUrl.includes('?') ? '&' : '?';
           assignSrcAndSeek(media, `${proxyUrl}${joiner}_r=${Date.now()}`, media.currentTime || 0, true);
@@ -787,10 +826,13 @@ document.addEventListener('DOMContentLoaded', () => {
         getPlayback(state.currentTrack, state.mode, true)
           .then(data => {
             if (!state.currentTrack) return;
-            media._usingDirect = true;
+            media._directUrl = data.url;
             media._proxyUrl = data.proxy_url;
-            assignSrcAndSeek(media, data.url, media.currentTime || 0, true);
-            armStartWatchdog(media, media.currentTime || 0, true, 'direct');
+            const startUrl = getPlayableUrl(data);
+            media._usingProxy = startUrl === data.proxy_url;
+            media._usingDirect = !media._usingProxy;
+            assignSrcAndSeek(media, startUrl, media.currentTime || 0, true);
+            armStartWatchdog(media, media.currentTime || 0, true, media._usingProxy ? 'proxy' : 'direct');
           })
           .catch(() => fallbackToYouTubePlayer(state.currentTrack));
         return;
@@ -1699,6 +1741,37 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 250);
   }
 
+  function moveYtHost(toVideo) {
+    // Move the outer host <div>, never the <iframe> itself. Reparenting the
+    // iframe reloads it and breaks the YouTube API (postMessage origin
+    // mismatch / error 150) when switching between audio and video mode.
+    const host = document.getElementById('ytAudioContainer');
+    if (!host) return;
+
+    if (toVideo) {
+      const wrapper = document.getElementById('ytPlayerWrapper');
+      if (wrapper && host.parentNode !== wrapper) wrapper.appendChild(host);
+      host.style.position = 'static';
+      host.style.top = 'auto';
+      host.style.left = 'auto';
+      host.style.width = '100%';
+      host.style.height = '100%';
+      host.style.overflow = 'hidden';
+      host.style.opacity = '1';
+      host.style.pointerEvents = 'auto';
+    } else {
+      if (host.parentNode !== document.body) document.body.appendChild(host);
+      host.style.position = 'fixed';
+      host.style.top = '-9999px';
+      host.style.left = '-9999px';
+      host.style.width = '1px';
+      host.style.height = '1px';
+      host.style.overflow = 'hidden';
+      host.style.opacity = '0.01';
+      host.style.pointerEvents = 'none';
+    }
+  }
+
   function fallbackToYouTubePlayer(track) {
     if (!track || !track.id) return;
     console.warn('Backend proxy restricted by cloud IP. Activating client-side YouTube player...');
@@ -1711,8 +1784,6 @@ document.addEventListener('DOMContentLoaded', () => {
     fullPlayIcon.classList.add('hidden');
 
     const ytContainer = document.getElementById('ytPlayerContainer');
-    const ytAudioCont = document.getElementById('ytAudioContainer');
-    const ytWrapper = document.getElementById('ytPlayerWrapper');
 
     if (state.mode === 'video') {
       if (ytContainer) ytContainer.style.display = 'block';
@@ -1720,23 +1791,24 @@ document.addEventListener('DOMContentLoaded', () => {
       if (ytContainer) ytContainer.style.display = 'none';
     }
 
+    moveYtHost(state.mode === 'video');
+
+    // Switching audio <-> video should not restart the song.
+    let resumeAt = 0;
+    try {
+      const currentVideo = state.ytPlayer && state.ytPlayer.getVideoData
+        ? state.ytPlayer.getVideoData()
+        : null;
+      if (currentVideo && currentVideo.video_id === track.id) {
+        resumeAt = state.ytPlayer.getCurrentTime() || 0;
+      }
+    } catch (e) {}
+
     function doPlay() {
       try {
-        if (state.mode === 'video' && ytWrapper) {
-          const iframe = state.ytPlayer.getIframe();
-          if (iframe && iframe.parentNode !== ytWrapper) {
-            ytWrapper.appendChild(iframe);
-          }
-        } else if (ytAudioCont) {
-          const iframe = state.ytPlayer.getIframe();
-          if (iframe && iframe.parentNode !== ytAudioCont) {
-            ytAudioCont.appendChild(iframe);
-          }
-        }
-
         state.ytPlayer.loadVideoById({
           videoId: track.id,
-          startSeconds: 0
+          startSeconds: resumeAt
         });
         state.ytPlayer.playVideo();
         startYtSync();

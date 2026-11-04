@@ -40,9 +40,10 @@ IS_CLOUD = bool(
 PUBLIC_URL = os.environ.get('RENDER_EXTERNAL_URL') if IS_RENDER else None
 CLOUDFLARED_PROC = None
 
-# Max chunk size (2MB) keeps responses below Vercel's 4.5MB payload limit while
-# reducing the number of round-trips for the proxy fallback.
-MAX_CHUNK = 2 * 1024 * 1024
+# Max chunk size. 4MB keeps responses below Vercel's ~4.5MB payload limit
+# while cutting the number of round-trips in half vs 2MB, which means the
+# player needs far fewer serverless invocations before playback starts.
+MAX_CHUNK = 4 * 1024 * 1024
 
 # Configure ffmpeg path safely (compatible with Vercel serverless / read-only environment)
 try:

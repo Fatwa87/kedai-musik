@@ -1,4 +1,4 @@
-const CACHE_NAME = 'kedaimusik-v9';
+const CACHE_NAME = 'kedaimusik-v11';
 const STATIC_ASSETS = [
   '/',
   '/static/css/style.css',
