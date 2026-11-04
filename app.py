@@ -34,6 +34,9 @@ TEMPLATE_DIR = os.path.join(BASE_DIR, 'templates')
 app = Flask(__name__, static_folder=STATIC_DIR, template_folder=TEMPLATE_DIR)
 PORT = int(os.environ.get('PORT', 5500))
 IS_RENDER = os.environ.get('RENDER') is not None
+IS_CLOUD = bool(
+    os.environ.get('VERCEL') or os.environ.get('RENDER') or os.environ.get('SPACE_ID')
+)
 PUBLIC_URL = os.environ.get('RENDER_EXTERNAL_URL') if IS_RENDER else None
 CLOUDFLARED_PROC = None
 
@@ -482,6 +485,11 @@ def extract_stream_url(video_id, media_type='audio', client_configs=None):
     `client_configs` may be supplied to force specific player clients
     (used by the diagnostics endpoint and cloud fallbacks).
     """
+    # On cloud hosts without cookies YouTube's bot check rejects every player
+    # client. Sequentially trying three clients only triples the spinner time
+    # before the browser can switch to its iframe fallback, so fail fast.
+    fast_fail = IS_CLOUD and not get_cookie_file()
+
     if media_type == 'audio':
         # Prefer m4a/AAC (works everywhere incl. iOS). Fall back to Opus or
         # the progressive MP4 (18) which always contains audio.
@@ -490,21 +498,27 @@ def extract_stream_url(video_id, media_type='audio', client_configs=None):
         # (The android clients only expose muxed format 18 for many videos,
         # which makes the "audio" player download the whole 12MB video.)
         if client_configs is None:
-            client_configs = [
-                {},
-                {'player_client': ['android']},
-                {'player_client': ['android_vr']},
-            ]
+            if fast_fail:
+                client_configs = [{'player_client': ['web']}]
+            else:
+                client_configs = [
+                    {},
+                    {'player_client': ['android']},
+                    {'player_client': ['android_vr']},
+                ]
     else:
         # 18 = 360p progressive MP4 (audio + video in one file).
         format_spec = '18/22/best[ext=mp4]/best'
         # The android client is the most reliable source for format 18.
         if client_configs is None:
-            client_configs = [
-                {'player_client': ['android']},
-                {'player_client': ['android_vr']},
-                {},
-            ]
+            if fast_fail:
+                client_configs = [{'player_client': ['android']}]
+            else:
+                client_configs = [
+                    {'player_client': ['android']},
+                    {'player_client': ['android_vr']},
+                    {},
+                ]
 
     last_err = None
     for cfg in client_configs:

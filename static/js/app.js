@@ -1740,10 +1740,22 @@ document.addEventListener('DOMContentLoaded', () => {
         });
         state.ytPlayer.playVideo();
         startYtSync();
-        playerSpinner.classList.add('hidden');
-        fullPlayIcon.classList.remove('hidden');
-        updatePlaybackUI(true);
-        showToast('🎶 Memutar via pemutar cloud langsung...');
+
+        // Do not claim success until YouTube actually starts. The old code
+        // hid the spinner immediately, so a blocked embed looked like it was
+        // playing while nothing happened.
+        const startedForTrack = track.id;
+        setTimeout(() => {
+          if (!state.isUsingYtFallback) return;
+          if (!state.currentTrack || state.currentTrack.id !== startedForTrack) return;
+          let pstate = null;
+          try { pstate = state.ytPlayer.getPlayerState(); } catch (e) {}
+          // 1 = playing, 3 = buffering
+          if (pstate === 1 || pstate === 3 || state.isPlaying) return;
+          playerSpinner.classList.add('hidden');
+          fullPlayIcon.classList.remove('hidden');
+          showToast('⚠️ Pemutar YouTube tidak merespons. Coba lagu lain.');
+        }, 9000);
       } catch (err) {
         console.error('YT play error:', err);
       }
@@ -1790,8 +1802,17 @@ document.addEventListener('DOMContentLoaded', () => {
           onStateChange: (event) => {
             if (event.data === YT.PlayerState.PLAYING) {
               state.isPlaying = true;
+              playerSpinner.classList.add('hidden');
+              fullPlayIcon.classList.remove('hidden');
               updatePlaybackUI(true);
               startYtSync();
+              const trackId = state.currentTrack && state.currentTrack.id;
+              if (trackId && state.ytToastFor !== trackId) {
+                state.ytToastFor = trackId;
+                showToast('🎶 Memutar via pemutar cloud langsung...');
+              }
+            } else if (event.data === YT.PlayerState.BUFFERING) {
+              if (!state.isPlaying) playerSpinner.classList.remove('hidden');
             } else if (event.data === YT.PlayerState.PAUSED) {
               state.isPlaying = false;
               updatePlaybackUI(false);
@@ -1810,10 +1831,17 @@ document.addEventListener('DOMContentLoaded', () => {
             }
           },
           onError: (e) => {
-            console.warn('YouTube Player API error code:', e.data);
+            const code = e.data;
+            console.warn('YouTube Player API error code:', code);
+            state.isPlaying = false;
             playerSpinner.classList.add('hidden');
             fullPlayIcon.classList.remove('hidden');
-            showToast('⚠️ Gagal memutar track dari YouTube.');
+            updatePlaybackUI(false);
+            if (code === 101 || code === 150) {
+              showToast('⚠️ Lagu ini tidak bisa diputar via cloud (embed dinonaktifkan). Coba lagu lain atau tambahkan cookies YouTube.');
+            } else {
+              showToast('⚠️ Gagal memutar track dari YouTube.');
+            }
           }
         }
       });
