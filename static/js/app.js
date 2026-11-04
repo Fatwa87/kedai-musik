@@ -272,18 +272,31 @@ document.addEventListener('DOMContentLoaded', () => {
     return data.url;
   }
 
-  function armDirectWatchdog(media, resumeTime, resumePlay) {
+  function armStartWatchdog(media, resumeTime, resumePlay, stage = 'direct') {
     const token = media._srcToken;
     clearTimeout(media._watchdogTimer);
+    const timeout = stage === 'direct' ? 4500 : 7000;
+
     media._watchdogTimer = setTimeout(() => {
-      if (token !== media._srcToken || !media._usingDirect) return;
+      if (token !== media._srcToken) return;
       if (media.readyState >= 2 || media.currentTime > 0.2) return;
 
-      console.warn('Direct CDN stalled, switching to proxy...');
-      media._usingDirect = false;
-      if (!media._proxyUrl) return;
-      assignSrcAndSeek(media, media._proxyUrl, resumeTime || 0, resumePlay);
-    }, 4500);
+      if (stage === 'direct' && media._usingDirect && media._proxyUrl) {
+        console.warn('Direct CDN stalled, switching to proxy...');
+        media._usingDirect = false;
+        assignSrcAndSeek(media, media._proxyUrl, resumeTime || 0, resumePlay);
+        armStartWatchdog(media, resumeTime, resumePlay, 'proxy');
+        return;
+      }
+
+      // Proxy also failed to produce audio/video in time. YouTube's iframe
+      // player is the last reliable option and starts much faster than
+      // hanging on a spinner forever.
+      if (state.currentTrack) {
+        console.warn('Proxy stalled, switching to YouTube player fallback...');
+        fallbackToYouTubePlayer(state.currentTrack);
+      }
+    }, timeout);
   }
 
   function prefetchPlayback(track, type, delayMs = 600) {
@@ -313,16 +326,17 @@ document.addEventListener('DOMContentLoaded', () => {
         media._usingDirect = true;
         media._proxyUrl = data.proxy_url;
         assignSrcAndSeek(media, getPlayableUrl(data), resumeTime, resumePlay);
-        armDirectWatchdog(media, resumeTime, resumePlay);
+        armStartWatchdog(media, resumeTime, resumePlay, 'direct');
       })
       .catch(err => {
         if (token !== state.playToken) return;
         console.warn('Playback resolve error:', err);
-        // Last resort: use the same-origin proxy. If that also fails the
-        // media error handler will activate the YouTube iframe fallback.
-        media._usingDirect = false;
-        media._proxyUrl = `/api/stream/${track.id}?type=${type}`;
-        assignSrcAndSeek(media, media._proxyUrl, resumeTime, resumePlay);
+        // Vercel / cloud IPs are often rejected by YouTube's bot check.
+        // The iframe player uses YouTube's own streaming and starts fast;
+        // retrying the same failing proxy only makes the spinner last longer.
+        if (state.currentTrack && state.currentTrack.id === track.id) {
+          fallbackToYouTubePlayer(track);
+        }
       });
   }
 
@@ -756,8 +770,7 @@ document.addEventListener('DOMContentLoaded', () => {
       //    Direct Google CDN failed
       //      -> instantly switch to the same-origin proxy.
       //    Proxy failed
-      //      -> refresh the URL and try direct; if direct is not allowed
-      //         (cloud IP mismatch), use the YouTube player fallback.
+      //      -> refresh the URL once, then use YouTube's iframe player.
       if ((media._retries || 0) < 3) {
         media._retries = (media._retries || 0) + 1;
         console.warn('Playback error detected, retry', media._retries, '...');
@@ -767,21 +780,17 @@ document.addEventListener('DOMContentLoaded', () => {
           const proxyUrl = media._proxyUrl || `/api/stream/${state.currentTrack.id}?type=${state.mode}`;
           const joiner = proxyUrl.includes('?') ? '&' : '?';
           assignSrcAndSeek(media, `${proxyUrl}${joiner}_r=${Date.now()}`, media.currentTime || 0, true);
+          armStartWatchdog(media, media.currentTime || 0, true, 'proxy');
           return;
         }
 
         getPlayback(state.currentTrack, state.mode, true)
           .then(data => {
             if (!state.currentTrack) return;
-            if (data.direct_ok === false) {
-              // Proxy-based playback already failed on this device; the
-              // iframe player is the only remaining option.
-              fallbackToYouTubePlayer(state.currentTrack);
-              return;
-            }
             media._usingDirect = true;
             media._proxyUrl = data.proxy_url;
             assignSrcAndSeek(media, data.url, media.currentTime || 0, true);
+            armStartWatchdog(media, media.currentTime || 0, true, 'direct');
           })
           .catch(() => fallbackToYouTubePlayer(state.currentTrack));
         return;

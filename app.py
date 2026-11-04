@@ -7,6 +7,7 @@ import re
 import io
 import base64
 import ipaddress
+import tempfile
 import subprocess
 import threading
 
@@ -45,6 +46,47 @@ try:
     FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     FFMPEG_PATH = None
+
+# YouTube blocks datacenter IPs (Vercel/Render/HF) with
+# "Sign in to confirm you're not a bot". A cookies.txt exported from a
+# signed-in browser fixes it without changing the player. Set either:
+#   YOUTUBE_COOKIES       -> raw cookies.txt content, or base64 of it
+#   YOUTUBE_COOKIES_FILE  -> absolute path to a cookies.txt file
+_COOKIE_FILE_PATH = None
+
+def get_cookie_file():
+    global _COOKIE_FILE_PATH
+    if _COOKIE_FILE_PATH and os.path.exists(_COOKIE_FILE_PATH):
+        return _COOKIE_FILE_PATH
+
+    path = (os.environ.get('YOUTUBE_COOKIES_FILE') or '').strip()
+    if path and os.path.exists(path):
+        _COOKIE_FILE_PATH = path
+        return path
+
+    raw = (os.environ.get('YOUTUBE_COOKIES') or '').strip()
+    if not raw:
+        return None
+
+    # Accept both plain Netscape cookies.txt and a base64-encoded copy
+    # (base64 is easier to paste into the Vercel dashboard).
+    if 'youtube.com' not in raw:
+        try:
+            decoded = base64.b64decode(raw, validate=True).decode('utf-8')
+            if 'youtube.com' in decoded:
+                raw = decoded
+        except Exception:
+            pass
+
+    cookie_path = os.path.join(tempfile.gettempdir(), 'kedaimusik_youtube_cookies.txt')
+    try:
+        with open(cookie_path, 'w', encoding='utf-8') as f:
+            f.write(raw)
+        _COOKIE_FILE_PATH = cookie_path
+        return cookie_path
+    except Exception as e:
+        print('Cookie file error:', e)
+        return None
 
 # Thread-safe in-memory caches
 STREAM_CACHE = {}       # key: f"{video_id}_{type}" -> (url, expiry_timestamp, content_type)
@@ -186,6 +228,9 @@ def get_ydl_options(extract_flat=True, format_spec='140/251/18/bestaudio/best'):
     }
     if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
         opts['ffmpeg_location'] = FFMPEG_PATH
+    cookie_file = get_cookie_file()
+    if cookie_file:
+        opts['cookiefile'] = cookie_file
     if extract_flat:
         opts['extract_flat'] = True
     else:
@@ -483,6 +528,9 @@ def extract_stream_url(video_id, media_type='audio', client_configs=None):
                 ydl_opts['extractor_args'] = {'youtube': cfg}
             if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
                 ydl_opts['ffmpeg_location'] = FFMPEG_PATH
+            cookie_file = get_cookie_file()
+            if cookie_file:
+                ydl_opts['cookiefile'] = cookie_file
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)

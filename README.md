@@ -119,6 +119,33 @@ Aplikasi ini sudah siap untuk di-deploy ke **Render.com** (100% Gratis) sehingga
 
 ---
 
+## ⚠️ Catatan Penting untuk Vercel / Cloud
+
+YouTube sering memblokir IP datacenter (Vercel, Render, Hugging Face) dengan pesan
+*“Sign in to confirm you're not a bot”*. Aplikasi ini sudah otomatis:
+
+- Memutar langsung dari CDN Google (tanpa proxy) agar mulai instan.
+- Beralih ke pemutar YouTube (`iframe`) dengan cepat bila server cloud diblokir,
+  supaya tidak berputar di spinner terlalu lama.
+
+Agar tetap **100% bebas iklan** di Vercel, tambahkan cookies YouTube milik Anda:
+
+1. Login ke YouTube di browser, lalu ekspor cookies memakai ekstensi
+   **“Get cookies.txt LOCALLY”** (file `cookies.txt` untuk `youtube.com`).
+2. Di dashboard Vercel → **Settings → Environment Variables**, tambahkan salah satu:
+   - `YOUTUBE_COOKIES` — isi file `cookies.txt` (disarankan dalam bentuk base64), atau
+   - `YOUTUBE_COOKIES_FILE` — path absolut file cookies di server.
+3. Base64 di Windows PowerShell:
+   ```powershell
+   [Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))
+   ```
+4. Redeploy. Cookies hanya disimpan sebagai environment variable, **jangan
+   di-commit ke GitHub** karena sifatnya setara password akun.
+
+Saat dijalankan di PC sendiri (`start_app.bat`), cookies biasanya tidak diperlukan.
+
+---
+
 ## 📁 Struktur Berkas
 
 ```
